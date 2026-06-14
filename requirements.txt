@@ -1,0 +1,30 @@
+# Mariposa Studio — Python dependencies for the main hub app (studio.py).
+# Install into the local venv:
+#     python -m venv venv
+#     ./venv/bin/python -m pip install -r requirements.txt        (macOS/Linux)
+#     .\venv\Scripts\python -m pip install -r requirements.txt    (Windows)
+#
+# Gemini (camera-prompts + animator) is called over plain HTTPS via urllib —
+# no SDK required. It only needs a GEMINI_API_KEY (see tools/captions-de/.env.example).
+
+# PySide6-Essentials (QtCore/Gui/Widgets/Svg + base) — NOT the full PySide6 meta.
+# The app only uses QtCore, QtGui, QtWidgets, QtSvg, so the heavy PySide6-Addons
+# (QtWebEngine ~588 MB, QtMultimedia/ffmpeg, Qt3D, Charts, Pdf, Designer…) are
+# intentionally excluded. This keeps the venv ~700 MB lighter on Mac and Windows.
+PySide6-Essentials==6.11.1
+opencv-python==4.13.0.92
+
+# Pinned transitively by opencv-python; listed for reproducible installs.
+numpy==2.4.6
+
+# Mozilla CA bundle — makes HTTPS calls to Gemini reliable on Python.org macOS
+# builds and Windows installs that don't wire in system certs automatically.
+certifi>=2024.0.0
+
+# ---------------------------------------------------------------------------
+# NOT installed here — these belong to individual tools and have heavy or
+# non-pip dependencies, kept in their own environments on purpose:
+#
+#   captions-de : WhisperX (~3 GB) lives in a separate venv at ~/whisperx.
+#                 Install via tools/captions-de/install.py. Also needs ffmpeg.
+#   flow-cropper: needs the ffmpeg binary on PATH (not a pip package).

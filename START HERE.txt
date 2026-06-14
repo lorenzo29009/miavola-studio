@@ -1,0 +1,30 @@
+============================================================
+  MARIPOSA STUDIO  —  START HERE
+============================================================
+
+FIRST TIME (install everything in one go):
+
+  • On a Mac:
+      Right-click  "install-mac.command"  →  Open  →  Open
+      (right-click the first time so macOS lets it run)
+
+  • On Windows:
+      Double-click  "install-windows.bat"
+      (if you see "Windows protected your PC": More info → Run anyway)
+
+  The installer handles Python, ffmpeg, German Captions (WhisperX) and asks
+  once for your Gemini key. When it finishes, the app opens by itself.
+
+
+EVERY OTHER TIME (just open the app):
+
+  • Mac:      double-click  "Mariposa Studio"  (the app icon)
+  • Windows:  use the  "Mariposa Studio"  shortcut on your Desktop / Start Menu
+              (tip: right-click it → Pin to taskbar)
+
+
+Updates install themselves: when a new version is out, the app shows an
+"Update now" button on launch.
+
+Everything else in this folder is the app's machinery — you don't need to
+open it.

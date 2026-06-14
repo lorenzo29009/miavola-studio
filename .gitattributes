@@ -1,0 +1,18 @@
+*.bat text eol=crlf
+*.command text eol=lf
+
+# Never ship secrets in a release zip (`git archive`), even if a stray .env
+# gets tracked. The real key also lives in history — rotate it (see CLAUDE.md).
+tools/captions-de/.env export-ignore
+.env export-ignore
+*/**/.env export-ignore
+
+# Keep the shared release zip tidy: dev-only files don't ship to the team.
+# (scripts/upsert_env.py and scripts/install-windows.ps1 are NEEDED at install
+# time, so they are intentionally NOT excluded.)
+CLAUDE.md export-ignore
+docs/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
+scripts/make_release_zip.py export-ignore
+scripts/smoketest.py export-ignore

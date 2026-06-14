@@ -1,0 +1,15 @@
+#!/bin/bash
+# Resolve the folder that *contains* the .app bundle (Mariposa Studio folder).
+APP_PATH="$(cd "$(dirname "$0")/../.." && pwd)"
+STUDIO_DIR="$(dirname "$APP_PATH")"
+
+cd "$STUDIO_DIR"
+
+if [ ! -x "./venv/bin/python" ]; then
+    /usr/bin/osascript <<EOF
+display dialog "Mariposa Studio isn't installed yet.\n\nPlease run install-mac.command (right-click → Open) from the Mariposa Studio folder first." buttons {"OK"} default button "OK" with icon stop with title "Mariposa Studio"
+EOF
+    exit 1
+fi
+
+exec ./venv/bin/python src/studio.py
