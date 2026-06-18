@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 # Windows consoles default to the legacy cp1252 codec, which can't encode the
@@ -44,6 +45,9 @@ if _ENV_PATH.exists():
 LINE_MAX = 20
 LEAD_MAX = 0.150
 TRAIL_MIN = 0.0
+# Shortest a single-line caption may stay on screen before single-line splitting
+# prefers a (readable) two-line caption instead. Matches merge_short_durations.
+MIN_PIECE_DUR = 0.6
 
 # ─── Real-screen line width model ────────────────────────────────────────────
 # The .srt is rendered as a CapCut-style caption: bold black text on a white
@@ -135,6 +139,23 @@ GERMAN_LOWERCASE = {
     "soll","sollst","sollen","sollt","sollte","sollten",
     "will","willst","wollen","wollt","wollte","wollten",
     "mag","magst","mögen","mögt","möchte","möchten",
+    # more closed-class function words (prepositions, distributive determiners,
+    # connective adverbs) that commonly OPEN a caption and so were being left
+    # capitalised — all evergreen function words, not video vocabulary
+    "von","bis","ab","je","pro","samt","gegenüber",
+    "jeder","jede","jedes","jeden","jedem","jegliche","jeglicher",
+    "egal","insgesamt","irgendwann","irgendwie","irgendwo","irgendwas",
+    "sonst","deshalb","deswegen","dennoch","jedoch","allerdings","außerdem",
+    "ohnehin","sowieso","eigentlich","bereits","überall","nirgends",
+}
+
+# Formal-address homographs: same spelling as lowercase function words above,
+# but capitalized when they mean the formal "you" (Sie/Ihr/Ihnen…). Gemini
+# (prompt rule V) sets their case from context; the safety net must NOT blindly
+# lowercase them or it would destroy the formal address. Defers to Gemini for
+# these specific words, so the same code serves both Duzen and Siezen content.
+GERMAN_FORMAL_HOMOGRAPHS = {
+    "sie", "ihr", "ihre", "ihren", "ihrem", "ihrer", "ihres", "ihnen",
 }
 
 # Optional per-project overrides to hyphenate specific long words at a chosen
@@ -166,7 +187,12 @@ COMPOUND_PREFIXES = [
 
 
 def auto_hyphenate(word: str) -> str:
-    if "\n" in word or len(word) <= LINE_MAX - 4:
+    # Hyphenate ONLY a word that cannot fit a single line on its own (by rendered
+    # width). A compound that fits a line — even a long-looking one like
+    # "Schilddrüsenwerte" or "Wassereinlagerungen" — is left whole, so it can sit
+    # on its own line with NO hyphen. The hyphen exists solely to break a word
+    # that is wider than one whole line across two lines.
+    if "\n" in word or text_width(word) <= LINE_W_MAX:
         return word
     if word in FORCE_HYPHEN:
         return FORCE_HYPHEN[word]
@@ -190,6 +216,22 @@ def apply_auto_hyphenation(text: str) -> str:
     return "\n".join(parts)
 
 
+# A "soft" compound hyphen is a line-break hyphen the model inserted INSIDE a
+# German compound: a letter, a hyphen, optionally a newline, then a LOWERCASE
+# continuation (auto_hyphenate splits compounds exactly this way). Real hyphens
+# keep an uppercase letter or digit on the right — E-Mail, T-Shirt, 100-Meter,
+# Work-Life-Balance — so they are left intact, as is the German suspended
+# compound "Nord- und Südseite" (a space follows the hyphen there).
+_SOFT_HYPHEN_RE = re.compile(r"(?<=\w)-\n?([a-zäöüß])")
+
+
+def join_soft_hyphens(text: str) -> str:
+    """Undo a model-inserted compound line-break hyphen so a word that fits one
+    line is shown WHOLE (no mid-line hyphen). Auto-hyphenation only exists to
+    break a word ACROSS two lines, never to show a hyphen inside one line."""
+    return _SOFT_HYPHEN_RE.sub(r"\1", text)
+
+
 def strip_punct(w: str) -> str:
     # \w in UNICODE mode covers letters from all the languages we care about
     # (ä, é, ñ, à, ç, ü, ...).
@@ -206,6 +248,19 @@ def clean_for_output(w: str) -> str:
 # call sites and tests behave as before.
 ACTIVE_LANG = "de"
 
+# Words the CURRENT video uses as a noun/name — learned from capitalised
+# mid-caption occurrences by learn_and_relabel_case(). normalize_case consults
+# it so the static function-word list never force-lowercases a word this video
+# clearly capitalises (e.g. the noun "Morgen" vs the adverb "morgen"). Empty
+# until learning runs, so default behaviour is unchanged.
+LEARNED_UPPER: set = set()
+
+# Set True by recase_with_ai() when a dedicated Gemini casing pass has corrected
+# the captions' capitalisation. While True, normalize_case() trusts that result
+# (German grammar from the model) and stops force-lowercasing from the static
+# function-word list, which can only mishandle homographs (Morgen/morgen, Sie/sie).
+CASE_FIXED_BY_AI = False
+
 # Caption length mode, set by main() at startup. "hybrid" (default) is the
 # long-standing behaviour: a natural mix of 1- and 2-line captions. "1" asks
 # the segmenter for one line per caption (shorter, more numerous units); the
@@ -221,9 +276,10 @@ def normalize_case(word: str) -> str:
         return out
     # German-only: lowercase function words even at the start of a caption
     # (TikTok-German house style).
-    if ACTIVE_LANG == "de":
-        lookup = strip_punct(word)
-        if lookup and lookup.lower() in GERMAN_LOWERCASE and out[0].isupper():
+    if ACTIVE_LANG == "de" and not CASE_FIXED_BY_AI:
+        low = strip_punct(word).lower()
+        if (low and low in GERMAN_LOWERCASE and low not in GERMAN_FORMAL_HOMOGRAPHS
+                and low not in LEARNED_UPPER and out[0].isupper()):
             return out[0].lower() + out[1:]
     return out
 
@@ -529,44 +585,57 @@ word_index refers to the [N] numbers above. Indices must be inside 0..{len(words
     return _single_line(prompt, "Input (numbered words):", _SINGLE_LINE_GENERIC)
 
 
-def segment_with_ai(words: list, video_context: str = "", language: str = "de") -> list:
+def _gemini_generate(prompt: str, retries: int = 3, timeout: int = 180):
+    """POST a prompt to Gemini and return the raw text the model emitted, or None.
+    Retries transient failures (timeouts, 429/5xx, dropped connections) with a
+    short backoff so a single slow response no longer drops the whole job to the
+    heuristic fallback — the difference between an AI-quality SRT and a degraded
+    one. Permanent errors (no key, 4xx) fail fast without retrying."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return None
-    try:
-        import urllib.request
-        import urllib.error
-    except ImportError:
-        return None
+    import time
+    import urllib.request
+    import urllib.error
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.0, "response_mime_type": "application/json"},
+    }).encode("utf-8")
+    model_id = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            return payload["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            transient = e.code in (408, 429, 500, 502, 503, 504)
+            print(f"Gemini API error: {e.code} {e.reason}"
+                  + (f" — retrying ({attempt}/{retries})" if transient and attempt < retries else ""))
+            if not transient:
+                return None
+        except Exception as e:
+            print(f"Gemini attempt {attempt}/{retries} failed: {e}")
+        if attempt < retries:
+            time.sleep(min(2 * attempt, 6))  # 2s, 4s, 6s backoff
+    print(f"Gemini gave up after {retries} attempts.")
+    return None
 
+
+def segment_with_ai(words: list, video_context: str = "", language: str = "de") -> list:
+    if not os.environ.get("GEMINI_API_KEY", "").strip():
+        return None
     if language != "de":
         prompt = build_generic_prompt(language, words, video_context)
     else:
         prompt = _build_german_prompt(words, video_context)
 
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "response_mime_type": "application/json"},
-    }).encode("utf-8")
-
-    model_id = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-
     print(f"Calling Gemini for {LANGUAGE_META[language]['name']} semantic segmentation...")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        print(f"Gemini API error: {e.code} {e.reason}")
-        print(e.read().decode("utf-8", errors="replace"))
+    text = _gemini_generate(prompt)
+    if text is None:
         return None
-    except Exception as e:
-        print(f"Gemini call failed: {e}")
-        return None
-
     try:
-        text = payload["candidates"][0]["content"]["parts"][0]["text"]
         segments = json.loads(text)
         if not isinstance(segments, list):
             return None
@@ -589,30 +658,16 @@ def segment_with_ai(words: list, video_context: str = "", language: str = "de") 
 
 
 def _call_gemini(prompt: str):
-    """POST a prompt to Gemini and return the JSON value the model emitted, or
-    None on any error. Shared by segmentation and the grouping-review pass."""
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
+    """Send a prompt to Gemini (with retry/backoff via _gemini_generate) and
+    return the JSON value the model emitted, or None on any error. Shared by the
+    grouping-review and casing passes."""
+    text = _gemini_generate(prompt)
+    if text is None:
         return None
-    import urllib.request
-    import urllib.error
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "response_mime_type": "application/json"},
-    }).encode("utf-8")
-    model_id = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        text = payload["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)
-    except urllib.error.HTTPError as e:
-        print(f"Gemini API error: {e.code} {e.reason}")
-        return None
     except Exception as e:
-        print(f"Gemini review/call failed: {e}")
+        print(f"Could not parse Gemini response: {e}")
         return None
 
 
@@ -689,7 +744,7 @@ _SINGLE_LINE_DE = """SINGLE-LINE MODE — this OVERRIDES the line-count guidance
 - Produce captions that each fit on ONE line (≤ ~22 characters of visible text). Do NOT aim for a mix of 1- and 2-line captions; aim for ONE line every single time.
 - To achieve this, segment into SHORTER, MORE NUMEROUS captions (typically 2–4 words each). Break a long breath group into several short captions at natural word boundaries — after a clause, before a conjunction, or between one inseparable unit and the next.
 - EVERY inseparable-unit rule above (F–O) still applies with FULL force: never split an article/possessive/demonstrative+noun, preposition+noun phrase, adverb+adjective/verb, auxiliary+participle, modal+infinitive, negation, separable particle+verb, comparative/quantifier+noun, or an idiom/product/borrowing. Keep each such unit whole inside one caption.
-- THE ONLY allowed 2-line caption is a single indivisible unit that is itself wider than one line: a long German compound (rule E) on its required hyphen split. Do NOT emit a "\\n" in any other case.
+- THE ONLY allowed 2-line caption is a single indivisible unit that is itself wider than one line: a long German compound (rule E) on its required hyphen split. Do NOT emit a "\\n" in any other case. A hyphen goes INSIDE a word ONLY at such a real two-line split; a compound that fits one line is written WHOLE, with NO hyphen.
 - Still NEVER strand a lone function word as its own caption — attach it per the rules. Emphasis repeats and list items still stand alone, one per caption.
 
 """
@@ -732,7 +787,7 @@ A. Group words into NATURAL caption units — a short complete clause or breath 
 B. Each visible line: AT MOST ~24 characters (including spaces). German has many narrow letters (i, l, t, r, f, ä) that take little room, so a line of 24 narrow chars is fine; lines full of wide letters (m, w) should be a little shorter.
 C. Therefore each caption: AT MOST ~48 characters total visible text. Going under is fine; going over is not.
 D. NEVER break a word in the middle of letters. Words that are NOT German compound nouns stay intact ("Entscheidung", "Erfahrung", "Computer", "Nachbarin" — never split).
-E. A German compound word > 24 chars (e.g., "Geschwindigkeitsbegrenzung", "Versicherungsgesellschaft", "Lebensmittelgeschäft", "100-Meter-Staffellauf") goes alone in its own caption and is broken at a meaningful compound boundary, hyphen at end of line 1: "Geschwindigkeits-\\nbegrenzung", "Versicherungs-\\ngesellschaft". This mid-word two-line split of a long compound is REQUIRED and must be kept.
+E. A German compound word > 24 chars (e.g., "Geschwindigkeitsbegrenzung", "Versicherungsgesellschaft", "Lebensmittelgeschäft", "100-Meter-Staffellauf") goes alone in its own caption and is broken at a meaningful compound boundary, hyphen at end of line 1: "Geschwindigkeits-\\nbegrenzung", "Versicherungs-\\ngesellschaft". This mid-word two-line split of a long compound is REQUIRED and must be kept. A hyphen may appear ONLY at the end of line 1 of such a real two-line split. If a compound fits on ONE line (≤ ~24 chars, e.g. "Wassereinlagerungen"), write it WHOLE with NO hyphen — never insert a hyphen into a word that stays on one line.
 
 INSEPARABLE SEMANTIC UNITS (these phrases MUST NEVER be split across a caption boundary OR across a "\\n" line break inside a caption — both apply EQUALLY):
 The "\\n" line break within a caption is just as much a "split" as starting a new caption. ALL inseparable-unit rules below apply to BOTH.
@@ -765,7 +820,7 @@ S. **GROUP INTO NATURAL UNITS (≈4–7 words).** A caption is a natural breath 
 TEXT RULES:
 T. Fix obvious Whisper transcription errors (only clear ones): wrong word boundaries ("im Stande" → "imstande"), obvious homophones that make no sense in context, and misheard number words (a stray word where a number was clearly spoken). Write spoken cardinal numbers as DIGITS ("sechs Kilo" → "6 Kilo", "achtzig Euro" → "80 Euro").
 U. Never add or skip words. EXCEPTION: when the speaker repeats a word for emphasis (e.g. "Nie … Nie"), KEEP the repeated word and give it its OWN caption — do not drop it and do not merge it into the neighbouring caption.
-V. German grammar capitalization: nouns and proper names capitalized; pronouns/verbs/articles/conjunctions/adverbs lowercase EVEN AT CAPTION START. Preserve formal address "Sie/Ihr/Ihre/Ihnen" (capitalized).
+V. Capitalization = write each word EXACTLY as it appears in the MIDDLE of a sentence. Capitalize ONLY words that are inherently capitalized in German: nouns, proper names, and the formal-address words Sie/Ihr/Ihre/Ihren/Ihrem/Ihrer/Ihres/Ihnen. Do NOT capitalize a word just because it starts the caption — lexical verbs, adjectives, adverbs, pronouns, articles, conjunctions and prepositions stay lowercase at caption start (e.g. "trinkst du genug", "gesund bleiben", "wichtig ist", "und dann").
 W. Remove periods, commas, semicolons, colons, exclamation marks. KEEP question marks, percent signs (%), slashes (/), ampersands (&), quotation marks.
 
 Editorial rules:
@@ -774,7 +829,7 @@ Editorial rules:
 3. Split after commas, periods, question marks.
 4. Keep meaningful units together as ONE token: product/brand names and English borrowings ("Social Media", "Fun Fact", "Best Friend").
 5. Never add or skip words. Only correct spelling/word-boundary errors as above. EXCEPTION: an emphatic repetition is kept and gets its own caption.
-6. German grammar capitalization: nouns and proper names capitalized; pronouns/verbs/articles/conjunctions/adverbs lowercase EVEN AT CAPTION START. Preserve formal address "Sie/Ihr/Ihre/Ihnen" (capitalized).
+6. Capitalization = write each word EXACTLY as it appears in the MIDDLE of a sentence. Capitalize ONLY inherently-capitalized words: nouns, proper names, and formal address Sie/Ihr/Ihre/Ihren/Ihrem/Ihrer/Ihres/Ihnen. Do NOT capitalize a word just because it starts the caption — lexical verbs, adjectives, adverbs, pronouns, articles, conjunctions and prepositions stay lowercase at caption start.
 7. Remove periods, commas, semicolons, colons, exclamation marks. KEEP question marks, percent signs (%), slashes (/), ampersands (&), quotation marks.
 {project_terms_block()}
 Examples of good captions (1 or 2 lines, each line ≤ ~24 chars, semantic units intact):
@@ -893,7 +948,12 @@ def fix_line_break(text: str) -> str:
     def clean(w):
         return re.sub(r"[^\wäöüÄÖÜß-]", "", w, flags=re.UNICODE).lower()
 
-    if clean(line1_words[-1]) not in LINE_BREAK_BAD_LAST:
+    # Never end line 1 on a word that binds to what FOLLOWS — a determiner
+    # (LINE_BREAK_BAD_LAST), a binding preposition/subordinator (MOVE_TRAILING),
+    # a one-word preposition (FORWARD_PREPS) or an intensifier (FORWARD_INTENS).
+    # NO_LINE_END is the union of all of these (a superset of LINE_BREAK_BAD_LAST),
+    # so this keeps "seit über 10 Jahren" / "in meinem eigenen Körper" intact.
+    if clean(line1_words[-1]) not in NO_LINE_END:
         return text
 
     current_break = len(line1_words)
@@ -901,7 +961,7 @@ def fix_line_break(text: str) -> str:
         new_line1 = " ".join(all_words[:new_break])
         new_line2 = " ".join(all_words[new_break:])
         last = clean(all_words[new_break - 1])
-        if last in LINE_BREAK_BAD_LAST:
+        if last in NO_LINE_END:
             continue
         if max(text_width(new_line1), text_width(new_line2)) <= LINE_W_MAX:
             return new_line1 + "\n" + new_line2
@@ -959,22 +1019,23 @@ def project_terms_block() -> str:
 
 def finalize_caption(text: str) -> str:
     normalized = apply_brand(normalize_text_preserve_breaks(text))
-    # Prefer ONE line. Test the fit on the UN-hyphenated text, so a compound that
-    # fits a line stays whole (no mid-line hyphen): auto-hyphenation only exists
-    # to break a word ACROSS two lines, never to show a hyphen inside one line.
-    flat = " ".join(normalized.replace("\n", " ").split())
+    # Collapse any model-inserted in-word compound hyphen back into the whole
+    # word, WHEREVER it sits — even mid-line (e.g. "meine Schilddrüsen-werte").
+    # A hyphen is only valid at the end of line 1 of a real two-line split, and
+    # that split is re-derived below from whole words; it is never shown mid-line.
+    whole = join_soft_hyphens(normalized)
+    flat = " ".join(whole.replace("\n", " ").split())
     if text_width(flat) <= LINE_W_MAX:
-        return flat
-    # Two lines are needed: now hyphenate long compounds so the break can fall at
-    # a compound boundary. Respect the model's own line break when both halves fit
-    # (it reflects semantic units, e.g. keeping "im Wartezimmer" together); only
-    # re-pack by width when the model gave no usable break.
-    hyphenated = apply_auto_hyphenation(normalized)
-    if "\n" in hyphenated:
-        parts = hyphenated.split("\n")
+        return flat  # one line, whole words, no hyphen
+    # Two lines are needed. Keep the model's own break when both halves already
+    # fit a line (it reflects a semantic unit, e.g. "meine\nWassereinlagerungen");
+    # otherwise re-pack by width. auto_hyphenate (width-gated) only splits a word
+    # that is itself wider than a whole line, and the hyphen lands at end of line 1.
+    if "\n" in whole:
+        parts = [p.strip() for p in whole.split("\n", 1)]
         if len(parts) == 2 and all(text_width(p) <= LINE_W_MAX for p in parts):
-            return fix_line_break(hyphenated)
-    return fix_line_break(pack_lines(hyphenated))
+            return fix_line_break(whole)
+    return fix_line_break(pack_lines(apply_auto_hyphenation(flat)))
 
 
 def _flat_text(seg: dict) -> str:
@@ -1027,6 +1088,28 @@ MOVE_TRAILING_FWD = {
     "ans", "aufs", "so",
 }
 MOVE_TRAILING = MOVE_TRAILING_CONJ | MOVE_TRAILING_FWD
+
+# Prepositions that bind to the words AFTER them — a line/caption must not end
+# on one or it strands the bound phrase ("durch | die Wassereinlagerungen").
+# Broader than MOVE_TRAILING (which is about MOVING words between captions); here
+# we only choose where NOT to break, so the common one-word prepositions are
+# safe to include and keep preposition+noun phrases intact.
+FORWARD_PREPS = {
+    "in", "an", "auf", "aus", "bei", "mit", "nach", "von", "vor", "zu", "über",
+    "unter", "um", "durch", "für", "gegen", "ohne", "seit", "zwischen", "bis",
+    "je", "pro", "neben", "hinter", "gegenüber", "ab", "samt", "trotz", "wegen",
+    "statt", "gen",
+}
+# Intensifiers / quantifiers that bind to the following adjective/adverb/noun
+# ("sehr | müde", "mehr | Haare") — never end a line on one.
+FORWARD_INTENS = {
+    "sehr", "ganz", "extrem", "ziemlich", "wirklich", "besonders", "total",
+    "recht", "so", "mehr", "weniger", "kaum", "fast", "viel", "wenig",
+}
+# A line must never END on a forward-binding word: a determiner/possessive
+# (LINE_BREAK_BAD_LAST), a binding preposition/subordinator (MOVE_TRAILING),
+# a one-word preposition or intensifier, or a bare number (binds to its noun).
+NO_LINE_END = LINE_BREAK_BAD_LAST | MOVE_TRAILING | FORWARD_PREPS | FORWARD_INTENS
 
 
 def move_trailing_binders(segments: list) -> list:
@@ -1261,6 +1344,201 @@ def merge_short_durations(segments: list, words: list, min_dur: float = 0.6) -> 
     return res
 
 
+def _binds_forward(tok: str) -> bool:
+    """True if `tok` binds to what FOLLOWS it, so a line/caption must not end on
+    it: a determiner/preposition/intensifier (NO_LINE_END) or a bare number
+    (which binds to its noun, "10 | Jahren")."""
+    w = _norm_word(tok)
+    return w in NO_LINE_END or bool(re.fullmatch(r"\d+([.,]\d+)?", w))
+
+
+def _split_one_line(tokens: list) -> list:
+    """Split a token list into the fewest consecutive one-line pieces, cutting at
+    the most BALANCED safe boundary — never right after a word that binds to what
+    follows. Balancing avoids stranding a lone short word as a sub-second caption
+    (the greedy "pack then strand the remainder" failure). A run that cannot be
+    broken safely (a bound pair, or a word wider than a line) is returned whole
+    and rendered on two lines by finalize_caption. Returns a list of token lists."""
+    if text_width(" ".join(tokens)) <= LINE_W_MAX or len(tokens) < 2:
+        return [tokens]
+    best = None
+    for k in range(1, len(tokens)):
+        if _binds_forward(tokens[k - 1]):
+            continue  # can't end a line on a forward-binding word
+        left = tokens[:k]
+        if text_width(" ".join(left)) > LINE_W_MAX:
+            continue  # left half must itself fit one line to make progress
+        cost = abs(text_width(" ".join(left)) - text_width(" ".join(tokens[k:])))
+        if best is None or cost < best[0]:
+            best = (cost, k)
+    if best is None:
+        return [tokens]  # no safe one-line break — keep whole (two-line caption)
+    k = best[1]
+    return [tokens[:k]] + _split_one_line(tokens[k:])
+
+
+def enforce_single_line(segments: list, words: list) -> list:
+    """Single-line mode: split any caption wider than one line into several
+    one-line captions at safe, balanced word boundaries, re-deriving each piece's
+    word-index range so timing stays correct. A piece that genuinely cannot fit
+    one line (a bound pair, or a single word wider than a line) is kept whole and
+    rendered on two lines by finalize_caption. This makes the one-line result
+    deterministic rather than relying on the model to count characters."""
+    out = []
+    for seg in segments:
+        flat = " ".join(join_soft_hyphens(seg["text"]).replace("\n", " ").split())
+        tokens = flat.split()
+        s, e = seg["start"], seg["end"]
+        chunks = _split_one_line(tokens) if len(tokens) >= 2 else [tokens]
+        # Need one distinct word index per chunk; if the caption already fits one
+        # line, can't be reduced, or spans fewer words than chunks, leave it whole.
+        if (text_width(flat) <= LINE_W_MAX or len(chunks) < 2
+                or len(chunks) > (e - s + 1)):
+            out.append({**seg, "text": flat})
+            continue
+        # Map token cut points to word indices ~1:1 within [s, e], strictly
+        # increasing and reserving one index per remaining chunk so it stays valid.
+        cuts, acc = [], 0
+        for ch in chunks:
+            cuts.append(acc)
+            acc += len(ch)
+        starts = [s]
+        for j in range(1, len(chunks)):
+            st = max(starts[-1] + 1, min(s + cuts[j], e - (len(chunks) - 1 - j)))
+            starts.append(st)
+        if starts[-1] > e or any(starts[k] >= starts[k + 1] for k in range(len(starts) - 1)):
+            out.append({**seg, "text": flat})  # degenerate mapping → don't split
+            continue
+        pieces = []
+        for j, ch in enumerate(chunks):
+            en = e if j == len(chunks) - 1 else starts[j + 1] - 1
+            pieces.append({**seg, "start": starts[j], "end": en, "text": " ".join(ch)})
+        # Duration guard: a one-line piece that flashes by too briefly to read is
+        # WORSE than a readable two-line caption. If splitting would create such a
+        # piece, keep the caption whole (finalize lays it out on ≤2 lines). This is
+        # the "two lines only when needed" rule applied to timing, not just width.
+        def _piece_dur(p):
+            try:
+                d = words[p["end"]]["end"] - words[p["start"]]["start"]
+                return d if d > 0 else MIN_PIECE_DUR
+            except Exception:
+                return MIN_PIECE_DUR  # unknown timing → don't block the split
+        if any(_piece_dur(p) < MIN_PIECE_DUR for p in pieces):
+            out.append({**seg, "text": flat})
+            continue
+        out.extend(pieces)
+    return out
+
+
+def learn_and_relabel_case(segments: list) -> list:
+    """German casing without hard-coded vocabulary. German capitalises nouns
+    everywhere, so casing is reliable in NON-initial caption positions; only the
+    first word of a caption is ambiguous (the model tends to capitalise it just
+    because it starts the line). So: learn each word's casing from non-initial
+    occurrences, then fix the caption-initial word to match. Also populates
+    LEARNED_UPPER so normalize_case won't force-lowercase a word this video
+    clearly uses as a noun (e.g. "Morgen" vs the adverb "morgen"). Evergreen — it
+    adapts to each video's own words instead of a fixed list."""
+    global LEARNED_UPPER
+    if ACTIVE_LANG != "de":
+        return segments
+    upper, lower = Counter(), Counter()
+    for seg in segments:
+        for line in seg["text"].split("\n"):
+            for pos, tok in enumerate(line.split()):
+                if pos == 0 or not tok[:1].isalpha():
+                    continue  # initial casing is unreliable; skip non-words
+                key = strip_punct(tok).lower()
+                if key:
+                    (upper if tok[:1].isupper() else lower)[key] += 1
+    # A word is a "noun in this video" with ≥2 capitalised mid-caption sightings
+    # and a capital-leaning majority (so a homograph like Morgen/morgen resolves
+    # to its dominant use). Lowercasing is conservative: only words never once
+    # seen capitalised mid-caption, so a noun is never accidentally lowered.
+    LEARNED_UPPER = {k for k, n in upper.items() if n >= 2 and n > lower.get(k, 0)}
+    learned_lower = {k for k, n in lower.items() if n >= 1 and upper.get(k, 0) == 0}
+
+    def relabel_first(tok: str) -> str:
+        if not tok[:1].isalpha():
+            return tok
+        key = strip_punct(tok).lower()
+        if not key or key in GERMAN_FORMAL_HOMOGRAPHS:
+            return tok  # leave Sie/Ihr to the model's context
+        if (tok[:1].isupper() and key not in LEARNED_UPPER
+                and (key in GERMAN_LOWERCASE or key in learned_lower)):
+            return tok[:1].lower() + tok[1:]
+        if tok[:1].islower() and key in LEARNED_UPPER:
+            return tok[:1].upper() + tok[1:]
+        return tok
+
+    out = []
+    for seg in segments:
+        lines = seg["text"].split("\n")
+        first = lines[0].split()
+        if first:
+            first[0] = relabel_first(first[0])
+            lines[0] = " ".join(first)
+        out.append({**seg, "text": "\n".join(lines)})
+    return out
+
+
+def _build_recase_prompt(captions: list) -> str:
+    listing = "\n".join(f"[{i}] {t}" for i, t in enumerate(captions))
+    last = len(captions) - 1
+    return f"""You are fixing ONLY the capitalisation of German TikTok caption fragments (numbered below, one per line). Return the SAME captions with correct German casing.
+
+RULES:
+- Capitalise nouns and proper names — German capitalises every noun, anywhere ("Morgen", "Ärzte", "Wassereinlagerungen", "Dosis", "Antonio Bianco").
+- A noun stays a noun after a determiner or quantifier — capitalise it: "jeden Morgen", "jeden Tag", "jede Woche", "am Abend", "die Dosis", "ihre Werte" (the noun "Werte" is capital regardless of the word before it). Watch the time-of-day nouns "Morgen/Abend/Mittag/Tag/Nacht" — capital as nouns ("jeden Morgen"), lowercase ONLY as the adverb "morgens/abends" or "morgen" meaning tomorrow.
+- Capitalise the formal-address words Sie, Ihr, Ihre, Ihren, Ihrem, Ihrer, Ihres, Ihnen when they mean the formal "you". Use the SURROUNDING captions as context: e.g. a doctor quoted speaking to the patient ("… der gleiche Satz: ihre Werte sind doch in Ordnung") is formal → "Ihre Werte". Keep "sie/ihr" lowercase only when they clearly mean she / they / her.
+- EVERYTHING ELSE is lowercase, INCLUDING THE FIRST WORD of a caption. These are mid-sentence fragments — never capitalise a word just because it starts the line. Verbs, adjectives, adverbs, pronouns, articles, prepositions and conjunctions stay lowercase at the start ("bis", "egal", "von", "jeden", "trinkst", "gesund", "und").
+- Change ONLY letter case. Do NOT add, remove, reorder, split, merge or respell any word. Do NOT change any digit, punctuation mark or spacing.
+
+Captions:
+{listing}
+
+Return a JSON array of EXACTLY {last + 1} strings — caption [0] first … caption [{last}] last — each the corresponding caption with corrected capitalisation and otherwise IDENTICAL (same words, same order, same punctuation)."""
+
+
+def recase_with_ai(segments: list, language: str = "de") -> list:
+    """Final casing pass — the path to near-zero casing revisions. Asks Gemini to
+    correct ONLY the capitalisation of the finished German captions (the task it
+    is most reliable at when it is not also segmenting, rewording or line-breaking
+    at the same time). Each returned caption is validated WORD-FOR-WORD: accepted
+    only if it has the same words in the same order (case-insensitively), so the
+    model can never change, drop or reorder a word — only its letter case. On a
+    confident result CASE_FIXED_BY_AI is set, so normalize_case trusts it instead
+    of the static list (which mishandles homographs like Morgen/morgen). Falls
+    back silently to the deterministic casing on any failure or --no-ai."""
+    global CASE_FIXED_BY_AI
+    if language != "de" or len(segments) < 1:
+        return segments
+    flats = [" ".join(_flat_text(s).split()) for s in segments]
+    data = _call_gemini(_build_recase_prompt(flats))
+    if not isinstance(data, list) or len(data) != len(flats):
+        print("Casing pass: no usable response — keeping deterministic casing.")
+        return segments
+
+    def words_key(t: str) -> list:
+        return [strip_punct(w).lower() for w in t.split() if strip_punct(w)]
+
+    out, fixed = [], 0
+    for seg, original, cased in zip(segments, flats, data):
+        if isinstance(cased, str) and words_key(cased) == words_key(original):
+            out.append({**seg, "text": " ".join(cased.split())})
+            fixed += 1
+        else:
+            out.append(seg)  # word mismatch → keep this caption's deterministic casing
+    # Only trust the pass when it confidently validated; otherwise fall back fully
+    # to the deterministic casing so we never lose the safety net to a bad call.
+    if fixed < len(flats) * 0.8:
+        print(f"Casing pass: low confidence ({fixed}/{len(flats)}) — keeping deterministic casing.")
+        return segments
+    CASE_FIXED_BY_AI = True
+    print(f"Casing pass: {fixed}/{len(flats)} captions recased by Gemini.")
+    return out
+
+
 def write_srt(segments: list, boundaries: list, out_path: Path):
     with open(out_path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments):
@@ -1339,6 +1617,21 @@ def main():
     segments = split_emphasis_repeats(segments)
     segments = merge_orphans(segments)
     segments = merge_short_durations(segments, words)
+    # Single-line mode: deterministically break any still-too-wide caption into
+    # one-line pieces (timing re-derived), so we don't rely on the model to count.
+    if LINE_MODE == "1":
+        segments = enforce_single_line(segments, words)
+    # German casing — two layers. First the deterministic learner (always; sets
+    # LEARNED_UPPER, fixes obvious caption-initial words; the offline floor).
+    segments = learn_and_relabel_case(segments)
+    # Then a dedicated Gemini casing pass that fixes the rest using real German
+    # grammar (word-for-word validated; this is what gets casing to ~99%). Runs
+    # whenever a key is present — INDEPENDENT of segmentation, so even a heuristic
+    # fallback (e.g. the segmentation call timed out) still gets AI-quality casing.
+    # Self-guards to a no-op without a key / for non-German / on any API failure.
+    if args.language == "de" and os.environ.get("GEMINI_API_KEY", "").strip():
+        print("Fixing German capitalization with Gemini...")
+        segments = recase_with_ai(segments, language=args.language)
     boundaries = compute_boundaries(segments, words, duration)
     write_srt(segments, boundaries, out_path)
     print(f"Wrote {len(segments)} captions to {out_path}")
