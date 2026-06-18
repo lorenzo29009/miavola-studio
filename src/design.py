@@ -338,6 +338,7 @@ QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{
     border: 1px solid {PAPER_LINE2};
     border-radius: {R_SM}px;
     padding: 9px 12px;
+    min-height: 20px;
     color: {TXT_HI};
     selection-background-color: {GREEN};
     selection-color: {GREEN_FG};
@@ -359,6 +360,50 @@ QComboBox QAbstractItemView {{
     selection-color: {IRIS_FG};
     padding: 4px;
 }}
+
+/* Select — the closed field. padding-right leaves room for the chevron; the
+   popup is a fully custom floating card (see widgets.Select). */
+QComboBox#Select {{ padding-right: 30px; }}
+QComboBox#Select::drop-down {{ width: 0; border: none; }}
+
+QFrame#SelectPopup {{ background: transparent; }}
+QFrame#SelectPopupCard {{
+    background: {PAPER_CARD};
+    border: 1px solid {PAPER_LINE2};
+    border-radius: 16px;
+}}
+QListView#SelectView {{
+    background: transparent;
+    border: none;
+    outline: none;
+}}
+/* Rows are painted by widgets._SelectRowDelegate (inset pill + text colour).
+   QSS here only sets the text indent and size — NO colour (the delegate owns
+   it) and NO margins (the row height must stay exactly the delegate's ROW_H). */
+QListView#SelectView::item {{
+    padding: 0px 14px;
+    font-size: 14px;
+}}
+/* Bottom fade — the "scroll for more" cue. Matches the card's white. */
+QFrame#SelectFade {{
+    border: none;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255,255,255,0), stop:0.55 rgba(255,255,255,160),
+        stop:1 rgba(255,255,255,255));
+    border-bottom-left-radius: 15px;
+    border-bottom-right-radius: 15px;
+}}
+QListView#SelectView QScrollBar:vertical {{
+    background: transparent; width: 11px; margin: 5px 3px 5px 0;
+}}
+QListView#SelectView QScrollBar::handle:vertical {{
+    background: {TXT_FAINT}; border-radius: 4px; min-height: 32px;
+}}
+QListView#SelectView QScrollBar::handle:vertical:hover {{ background: {TXT_DIM}; }}
+QListView#SelectView QScrollBar::add-line:vertical,
+QListView#SelectView QScrollBar::sub-line:vertical {{ height: 0; border: none; }}
+QListView#SelectView QScrollBar::add-page:vertical,
+QListView#SelectView QScrollBar::sub-page:vertical {{ background: transparent; }}
 
 QPlainTextEdit#Console {{
     background: {PAPER_WELL};

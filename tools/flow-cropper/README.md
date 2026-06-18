@@ -24,19 +24,42 @@ CTA:
   <campaign>/CTA2/9x16/*.mp4   →  <campaign>/CTA2/4x5/*.mp4
 ```
 
-Two creative types with different naming conventions:
+AI and UGC creatives share **one** naming convention:
 
 ```
-AI :   9x16 - AI{n}-{i} - {name}.mp4
-       9x16 - AI{n}-{CTA}-{i} - {name}.mp4
-
-UGC:   {format} - {concept} - 9x16_{creator}_C{n}-{i} - {awareness} - {product}.mp4
-       {format} - {concept} - 9x16_{creator}_C{n}-{CTA}-{i} - {awareness} - {product}.mp4
+{ad_format} - {avatar} - 9x16[_{creator}]_{id}-{i} - {awareness} - {product}.mp4
+{ad_format} - {avatar} - 9x16[_{creator}]_{id}-{CTA}-{i} - {awareness} - {product}.mp4
 ```
 
-If the folder name starts with **AI{n}** the tool auto-picks AI mode and the number.
-If it starts with **C{n}** the tool still asks (because some AI campaigns also start with C).
-Otherwise the tool asks for the type explicitly.
+- `id` is the **full creative id**, verbatim — `C893`, `AI78`, `Cr906`…
+- `creator` is **optional** (AI creatives usually have none).
+
+e.g.
+
+```
+UGC - GeGe - 9x16_Marco_Schlegelmilch_C893-2 - Problem Aware - Umwandler.mp4
+WB - GeGe - 9x16_AI78-4 - Problem Aware - Umwandler.mp4
+```
+
+The `Videoformat` (9x16 / 4x5) and the per-clip index (`-{i}`, the "Hook") are
+filled in by the tool. In the generic briefing tag Notion creates per creative,
+they appear as the literal placeholders `Videoformat` and `Hook`:
+
+```
+UGC - GeGe - Videoformat_Marco_Schlegelmilch_C893-Hook - Problem Aware - Umwandler
+```
+
+In the app you fill the naming fields two ways (a segmented toggle, no separate
+AI/UGC switch — the id decides that):
+
+- **Auto** — paste that briefing tag; the form is hidden and everything is read
+  straight from the tag.
+- **Manual** — fill the fields yourself. **Ad format** and **Avatar** are
+  dropdowns of the known Notion entries (emoji + name); **Creator** is optional.
+
+If the folder name is **AI{n}** the tool prefills the id and switches to
+**Manual** (AI creatives have no briefing tag). A **C{n}** folder just prefills
+the id.
 
 The tool is **idempotent** — already-cropped files are skipped on re-run.
 
@@ -63,12 +86,9 @@ The tool is **idempotent** — already-cropped files are skipped on re-run.
 ### macOS — double-click `crop.command`
 
 1. Pick the campaign folder.
-2. If the folder name is `AI{n}` (e.g. `AI63`), the AI number is filled in automatically.
-3. Otherwise pick the type (**AI** or **UGC**) when asked.
-4. Fill the remaining fields:
-   - **AI**: AI number, Creative name.
-   - **UGC**: C number, Concept, Creator, Format, Awareness stage, Product.
-5. The script runs. Cancel any dialog to exit cleanly.
+2. If the folder name is `AI{n}` / `C{n}` (e.g. `AI63`), the creative id is filled in automatically.
+3. Fill the fields: creative id, Ad format Kürzel, Avatar Kürzel, Creator (optional), Awareness stage, Product.
+4. The script runs. Cancel any dialog to exit cleanly.
 
 ### Windows — double-click `crop.bat`
 
@@ -92,14 +112,17 @@ On modern Macs/PCs, 2–3 workers is sweet spot. Higher numbers usually don't he
 ## CLI (no dialogs)
 
 ```
-# AI one-shot
-python crop.py /path/to/campaign 63 Pharmacist
+# one-shot: --creative FOLDER ID AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT
+python crop.py --creative /path/to/campaign C893 UGC GeGe "Marco Schlegelmilch" "Problem Aware" Umwandler
 
-# UGC one-shot
-python crop.py --ugc /path/to/campaign 807 K41 Sandra_Lung "Product Aware"
+# AI creative — empty creator
+python crop.py --creative /path/to/campaign AI78 WB GeGe "" "Problem Aware" Umwandler
 
-# tune worker count for either
-python crop.py --workers 4 /path/to/campaign 63 Pharmacist
+# preview only (no files changed)
+python crop.py --dry-run --creative /path/to/campaign C893 UGC GeGe "Marco Schlegelmilch" "Problem Aware" Umwandler
+
+# undo the last run for a campaign
+python crop.py --undo /path/to/campaign
 ```
 
 ---
@@ -113,4 +136,4 @@ Right-click the `.command` file → **Open** → confirm. macOS remembers your c
 Run `install-mac.command` or `install-windows.bat` first. Restart the terminal afterwards on Windows.
 
 **Output filenames are wrong**
-Re-run with the correct AI/C number and creative name. The first pass renames in place — existing files in `4x5/` are not overwritten, so you may want to delete them before re-running.
+Re-run with the correct fields (or re-paste the tag). The first pass renames in place — existing files in `4x5/` are not overwritten, so you may want to delete them before re-running. You can also use **Undo last run** in the app, or `python crop.py --undo /path/to/campaign`.

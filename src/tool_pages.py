@@ -28,7 +28,7 @@ from core import (
     IS_MAC, IS_WINDOWS, EXPORTS_DIR, FLOW_CROPPER_DIR, CAPTIONS_DIR, EXTRACT_DIR, WHISPERX_PY, studio_python, make_qprocess_env, arrow_icon, reveal_in_finder, open_folder,
 )
 from widgets import (
-    Card, FormRow, DropZone, Segmented, Field, ChipGroup, Switch, ConsoleView, AppBar, _panel,
+    Card, FormRow, DropZone, Segmented, Field, ChipGroup, Switch, ConsoleView, AppBar, Select, _panel,
 )
 
 # ---------------------------------------------------------------------------
@@ -384,6 +384,76 @@ class ToolPage(QWidget):
 # ---------------------------------------------------------------------------
 # Flow Cropper
 
+# Avatars and ad formats come from the Notion databases. Each entry is
+# (emoji, display name, Kürzel) — the Kürzel is what goes into the filename and
+# what the briefing tag carries. The lists are ordered with the most-used ones
+# first (per the team's request), then the rest.
+FLOW_AVATARS = [
+    ("👩‍🦳", "Härtefall Hertha (55)", "HäHe"),
+    ("💇‍♀️", "Haarausfall Hannah (40)", "HaaHa"),
+    ("👱‍♀️", "Hashi Helga (55)", "HasHe"),
+    ("👥", "Libido Linda (41)", "LiLi"),
+    ("👩", "Operierte Olga (57)", "OpOl"),
+    ("🧙‍♀️", "Geschenke Gerald (55)", "GeGe"),
+    ("😴", "Müde Melina (48)", "MüMe"),
+    ("🚽", "Verdauungs Verena (39)", "VeVe"),
+    ("🏋️‍♀️", "Abnehm Anja (45)", "AbAn"),
+    ("👵", "Härtefall Heinz (55)", "HärHei"),
+    ("👩🏻", "Pille Pauline (26)", "PiPa"),
+    ("👩‍🦰", "Hertha Junior (29)", "HeJu"),
+    ("💦", "Wasser Waltraud (55)", "WaWa"),
+    ("🤰", "Blähbauch Berta (42)", "BlBe"),
+    ("👶", "Mama Mia (34)", "MaMi"),
+    ("🧠", "Brainfog Betty (45)", "BrBe"),
+    ("🙅‍♀️", "Undiagnostizierte Uli", "UnUl"),
+    ("✨", "Strahlende Sandra (42)", "StSa"),
+]
+
+FLOW_AD_FORMATS = [
+    ("🙋‍♀️", "UGC", "UGC"),
+    ("📼", "MVSL", "MVSL"),
+    ("🗣️", "Storytime", "STO"),
+    ("💡", "Idea Ad", "IA"),
+    ("🖼️", "Whiteboard", "WB"),
+    ("🗞️", "Video Clickbait", "VC"),
+    ("🎨", "Animation", "AN"),
+    ("👶", "Comedy", "BC"),
+    ("👩‍🏫", "Doku", "DOKU"),
+    ("💬", "Kommentar Reaction", "KR"),
+    ("📺", "Narrated UGC", "NUGC"),
+    ("⏪", "Reverse Ad", "RA"),
+    ("🫀", "Sprechende Organe", "SO"),
+    ("🎙️", "Authority Podcast", "AP"),
+    ("🥼", "Comic Doctor", "COD"),
+    ("🤪", "Crazy Doctor", "CD"),
+    ("😆", "Funny", "FUN"),
+    ("☎️", "Kundenanruf", "KA"),
+    ("📣", "Narrator Ad", "NA"),
+    ("🛒", "Sprechende Produkte", "SP"),
+    ("🎤", "Straßenumfrage", "SU"),
+    ("🎭", "Vorher/Nachher", "VN"),
+    ("📦", "Unboxing", "UNB"),
+    ("👷", "Versuchsaufbau", "VA"),
+]
+
+
+def _fill_kuerzel_combo(combo: QComboBox, rows: list[tuple[str, str, str]]):
+    """Populate a combo with '<emoji>  <name> — <Kürzel>' labels; the Kürzel is
+    stored as the item data (and is what the filename uses)."""
+    for emoji, name, kuerzel in rows:
+        combo.addItem(f"{emoji}  {name}  —  {kuerzel}", kuerzel)
+
+
+def _select_kuerzel(combo: QComboBox, kuerzel: str):
+    """Select the item whose Kürzel matches; if none, add it so a pasted tag
+    with an unknown code is never silently lost."""
+    idx = combo.findData(kuerzel)
+    if idx < 0:
+        combo.addItem(kuerzel, kuerzel)
+        idx = combo.findData(kuerzel)
+    combo.setCurrentIndex(idx)
+
+
 class FlowCropperPage(ToolPage):
     title = "Flow Cropper"
     subtitle = ("Reframe a whole project from 9:16 to 4:5 and rename it following "
@@ -399,42 +469,56 @@ class FlowCropperPage(ToolPage):
 
         lay = self.settings_card()
 
-        # Naming type — segmented, switches which field set is shown.
-        type_row = QHBoxLayout(); type_row.setSpacing(12)
-        type_row.addWidget(self.group_label("NAMING"))
-        type_row.addStretch(1)
-        self.mode = Segmented(["AI", "UGC"])
-        self.mode.currentChanged.connect(lambda _i: self._update_visibility(self.mode.currentText()))
-        type_row.addWidget(self.mode)
-        tw = _panel(type_row); lay.addWidget(tw)
+        # How to fill the naming fields: Auto (paste the briefing's creative tag
+        # and we parse it) or Manual (pick/type each field yourself).
+        mode_row = QHBoxLayout(); mode_row.setSpacing(12)
+        mode_row.addWidget(self.group_label("FILL FIELDS"))
+        mode_row.addStretch(1)
+        self.input_mode = Segmented(["Auto", "Manual"])
+        self.input_mode.currentChanged.connect(
+            lambda _i: self._update_visibility(self.input_mode.currentText()))
+        mode_row.addWidget(self.input_mode)
+        lay.addWidget(_panel(mode_row))
 
-        # AI field set.
-        self.ai_num = QLineEdit(); self.ai_num.setPlaceholderText("e.g. 63")
-        self.ai_num.editingFinished.connect(self._normalize_ai_num)
-        self.ai_name = QLineEdit(); self.ai_name.setPlaceholderText("e.g. Pharmacist")
-        self.ai_group = self.grid_2col([
-            Field("AI number", self.ai_num), Field("Creative name", self.ai_name),
-        ])
-        lay.addWidget(self.ai_group)
+        # Auto: paste the generic creative tag Notion creates per briefing,
+        # e.g.  UGC - GeGe - Videoformat_Marco_Schlegelmilch_C893-Hook - Problem Aware - Umwandler
+        # We parse it straight into the fields — the form itself stays hidden.
+        self.tag = QLineEdit()
+        self.tag.setPlaceholderText(
+            "Ad Format - Avatar - Videoformat_Vorname_Nachname_CXXX-Hook - Awareness Stage - Produkt")
+        self.tag.textChanged.connect(self._on_tag_changed)
+        self.tag_field = Field("Paste the creative tag", self.tag)
+        lay.addWidget(self.tag_field)
 
-        # UGC field set.
-        self.c_num = QLineEdit(); self.c_num.setPlaceholderText("e.g. 807")
-        self.concept = QLineEdit(); self.concept.setPlaceholderText("e.g. K41")
-        self.creator = QLineEdit(); self.creator.setPlaceholderText("e.g. Sandra Lung")
-        self.awareness = QComboBox()
+        self.tag_hint = QLabel("")
+        self.tag_hint.setObjectName("DropMeta")
+        self.tag_hint.setWordWrap(True)
+        lay.addWidget(self.tag_hint)
+
+        # Manual field set. The creative id (C893 / AI78) decides AI vs UGC on
+        # its own, so there's no separate type toggle. Avatar and Ad format are
+        # dropdowns of the known Notion entries.
+        self.num = QLineEdit(); self.num.setPlaceholderText("e.g. C857 or AI78")
+        self.num.editingFinished.connect(self._normalize_id)
+        self.ad_format = Select()
+        _fill_kuerzel_combo(self.ad_format, FLOW_AD_FORMATS)
+        self.avatar = Select()
+        _fill_kuerzel_combo(self.avatar, FLOW_AVATARS)
+        self.creator = QLineEdit()
+        self.creator.setPlaceholderText("e.g. Marco Schlegelmilch — leave empty for AI")
+        self.awareness = Select()
         self.awareness.addItems(["Problem Aware", "Solution Aware", "Product Aware"])
-        self.fmt = QLineEdit(); self.fmt.setPlaceholderText("e.g. UGC")
         # Product is pre-filled with the usual default (Umwandler) so it's clear
         # what will be used — the user can overwrite it.
         self.product = QLineEdit(); self.product.setText("Umwandler")
-        self.ugc_group = self.grid_2col([
-            Field("C number", self.c_num), Field("Concept", self.concept),
-            Field("Creator", self.creator), Field("Awareness", self.awareness),
-            Field("Format", self.fmt), Field("Product", self.product),
+        self.fields_group = self.grid_2col([
+            Field("Creative id", self.num), Field("Ad format", self.ad_format),
+            Field("Avatar", self.avatar), Field("Creator (optional)", self.creator),
+            Field("Awareness", self.awareness), Field("Product", self.product),
         ])
-        lay.addWidget(self.ugc_group)
+        lay.addWidget(self.fields_group)
 
-        self._update_visibility(self.mode.currentText())
+        self._update_visibility(self.input_mode.currentText())
 
     def extra_action_buttons(self) -> list[QWidget]:
         undo = QPushButton("Undo last run")
@@ -481,28 +565,97 @@ class FlowCropperPage(ToolPage):
         proc.start(program, args)
 
     def _update_visibility(self, mode: str):
-        is_ai = (mode == "AI")
-        self.ai_group.setVisible(is_ai)
-        self.ugc_group.setVisible(not is_ai)
+        # Auto = just the paste box; Manual = just the form. Never both.
+        is_auto = (mode == "Auto")
+        self.tag_field.setVisible(is_auto)
+        self.tag_hint.setVisible(is_auto)
+        self.fields_group.setVisible(not is_auto)
 
-    def _normalize_ai_num(self):
-        v = self.ai_num.text().strip()
-        m = re.match(r"^\s*(?:AI|ai)?\s*(\d+)\s*$", v)
-        if m:
-            self.ai_num.setText(m.group(1))
+    @staticmethod
+    def _parse_tag(tag: str) -> Optional[dict]:
+        """Parse a generic creative tag into form-field values, or None.
+
+        Expected shape (the briefing tag uses the literal placeholders
+        'Videoformat' and 'Hook', which we ignore — the cropper fills in the
+        real aspect ratio and per-clip index):
+
+            AdFormat - Avatar - Videoformat_First_Last_C893-Hook - Awareness - Product
+
+        The creator part may be absent (AI), and the id can be any
+        <letters><digits> code (C893, AI78, Cr906).
+        """
+        parts = [p.strip() for p in tag.split(" - ")]
+        if len(parts) != 5:
+            return None
+        ad_format, avatar, middle, awareness, product = parts
+        tokens = [t for t in middle.split("_") if t]
+        if len(tokens) < 2:        # need at least <videoformat>_<id>
+            return None
+        m = re.match(r"^([A-Za-z]+\d+)(?:-.*)?$", tokens[-1])   # <id>[-<hook>]
+        if not m or not (ad_format and avatar):
+            return None
+        return {
+            "creative_id": m.group(1),
+            "ad_format": ad_format,
+            "avatar": avatar,
+            "creator": " ".join(tokens[1:-1]),   # tokens[0] is the videoformat
+            "awareness": awareness,
+            "product": product,
+        }
+
+    def _on_tag_changed(self, text: str):
+        text = text.strip()
+        if not text:
+            self.tag_hint.setText("")
+            self.tag_hint.setStyleSheet("")
+            return
+        parsed = self._parse_tag(text)
+        if not parsed:
+            self.tag_hint.setText(
+                "Couldn't read that tag. It should look like "
+                "“UGC - GeGe - Videoformat_First_Last_C893-Hook - Problem Aware - Umwandler”. "
+                "Check it, or switch to Manual.")
+            self.tag_hint.setStyleSheet(f"color:{ERR_COLOR}; background:transparent;")
+            return
+        # Fill the (hidden) form so build_command/validate read a single source.
+        self.num.setText(parsed["creative_id"])
+        _select_kuerzel(self.ad_format, parsed["ad_format"])
+        _select_kuerzel(self.avatar, parsed["avatar"])
+        self.creator.setText(parsed["creator"])
+        idx = self.awareness.findText(parsed["awareness"])
+        if idx >= 0:
+            self.awareness.setCurrentIndex(idx)
+        if parsed["product"]:
+            self.product.setText(parsed["product"])
+        creator = parsed["creator"] or "no creator"
+        self.tag_hint.setText(
+            f"Read ✓ — {parsed['ad_format']} · {parsed['avatar']} · "
+            f"{parsed['creative_id']} · {creator} · {parsed['awareness']} · {parsed['product']}")
+        self.tag_hint.setStyleSheet(f"color:{OK_COLOR}; background:transparent;")
+
+    def _normalize_id(self):
+        # A bare number defaults to a C id (e.g. "857" → "C857"); anything with
+        # a letter prefix (C, AI, Cr…) is left as typed.
+        v = self.num.text().strip()
+        if v and v[0].isdigit():
+            self.num.setText(f"C{v}")
 
     def _on_folder_changed(self, text: str):
         name = Path(text).name if text else ""
-        m_ai = re.match(r"^AI\s*(\d+)", name, re.IGNORECASE)
-        m_c  = re.match(r"^C\s*(\d+)", name, re.IGNORECASE)
-        if m_ai:
-            self.mode.setCurrentText("AI")
-            if not self.ai_num.text().strip():
-                self.ai_num.setText(m_ai.group(1))
-        elif m_c:
-            self.mode.setCurrentText("UGC")
-            if not self.c_num.text().strip():
-                self.c_num.setText(m_c.group(1))
+        # Any leading letter prefix + number is the creative id: A10, AI28,
+        # C294, Cr906… (kept verbatim).
+        m = re.match(r"^([A-Za-z]{1,4})[\s_-]*(\d+)", name)
+        if not m:
+            return
+        creative_id = f"{m.group(1)}{m.group(2)}"
+        if not self.num.text().strip():
+            self.num.setText(creative_id)
+        # AI campaigns have no Notion briefing tag, so jump straight to Manual.
+        # Segmented.setCurrentText doesn't emit currentChanged, so refresh the
+        # form visibility ourselves.
+        if creative_id.upper().startswith("AI"):
+            self.input_mode.setCurrentText("Manual")
+            self._update_visibility("Manual")
 
     def validate(self) -> Optional[str]:
         if not self.folder.value():
@@ -511,17 +664,17 @@ class FlowCropperPage(ToolPage):
             return "The campaign folder doesn't exist."
         if not (FLOW_CROPPER_DIR / "crop.py").exists():
             return f"crop.py not found in {FLOW_CROPPER_DIR}"
-        if self.mode.currentText() == "AI":
-            if not self.ai_num.text().strip() or not self.ai_name.text().strip():
-                return "AI mode needs an AI number and a creative name."
-        else:
-            if not all([self.c_num.text().strip(), self.concept.text().strip(),
-                        self.creator.text().strip()]):
-                return "UGC mode needs C number, Concept and Creator."
+        if self.input_mode.currentText() == "Auto" and not self._parse_tag(self.tag.text().strip()):
+            return "Couldn't read the pasted tag. Fix it, or switch to Manual."
+        # Creator is optional (AI has none); id, ad format and avatar are required.
+        if not all([self.num.text().strip(), self.ad_format.currentData(),
+                    self.avatar.currentData()]):
+            return ("Fill in the Creative id, Ad format and Avatar — paste a "
+                    "tag in Auto, or pick them in Manual.")
         return None
 
     def build_command(self):
-        self._normalize_ai_num()
+        self._normalize_id()
         py = studio_python()
         script = str(FLOW_CROPPER_DIR / "crop.py")
         # No --workers flag: crop.py defaults to 1 (one ffmpeg already saturates
@@ -529,15 +682,11 @@ class FlowCropperPage(ToolPage):
         args = ["-u", script]
         if self.preview.isChecked():   # dry-run toggle
             args.append("--dry-run")
-        if self.mode.currentText() == "AI":
-            args += [self.folder.value(), self.ai_num.text().strip(), self.ai_name.text().strip()]
-        else:
-            fmt = self.fmt.text().strip()
-            product = self.product.text().strip() or "Umwandler"
-            args += ["--ugc", self.folder.value(),
-                     self.c_num.text().strip(), self.concept.text().strip(),
-                     self.creator.text().strip(), self.awareness.currentText(),
-                     fmt, product]
+        product = self.product.text().strip() or "Umwandler"
+        # crop.py takes the id verbatim and the Kürzel codes; creator may be "".
+        args += ["--creative", self.folder.value(), self.num.text().strip(),
+                 self.ad_format.currentData(), self.avatar.currentData(),
+                 self.creator.text().strip(), self.awareness.currentText(), product]
         return py, args, FLOW_CROPPER_DIR
 
     def after_finished(self, code: int):

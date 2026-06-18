@@ -2,25 +2,30 @@
 """
 Flow Cropper — 9:16 → 4:5 batch crop + smart rename.
 
-Supports two creative types with different naming conventions:
+AI and UGC creatives share ONE naming convention:
 
-AI (existing):
-    9x16 - AI{n}-{i} - {name}.mp4
-    9x16 - AI{n}-{CTA}-{i} - {name}.mp4   (with CTA subfolders)
+    {ad_format} - {avatar} - 9x16[_{creator}]_{id}-{i} - {awareness} - {product}.mp4
+    {ad_format} - {avatar} - 9x16[_{creator}]_{id}-{CTA}-{i} - {awareness} - {product}.mp4
 
-UGC (new):
-    {format} - {concept} - 9x16_{creator}_C{n}-{i} - {awareness} - {product}.mp4
-    {format} - {concept} - 9x16_{creator}_C{n}-{CTA}-{i} - {awareness} - {product}.mp4
+`id` is the full creative id, verbatim (e.g. C893, AI78, Cr906). `creator` is
+optional — AI creatives usually have none.
 
-Creative type is auto-detected from the folder name:
-    folder named "AI63"        → AI mode, num = 63
-    folder named "C807" / "C807-1" → UGC mode, num = 807
-    anything else              → user is asked
+e.g.  UGC - GeGe - 9x16_Marco_Schlegelmilch_C893-2 - Problem Aware - Umwandler.mp4
+      WB - GeGe - 9x16_AI78-4 - Problem Aware - Umwandler.mp4
+
+The "Videoformat" segment (9x16 / 4x5) and the per-clip index ("-{i}", the
+"Hook") are filled in by the tool; in the generic briefing tag they appear as
+the literal placeholders "Videoformat" and "Hook".
+
+The creative id is auto-detected from the folder name:
+    folder named "AI63"            → id AI63
+    folder named "C807" / "C807-1" → id C807
+    anything else                  → user is asked
 
 Usage:
-    crop.py                                       (interactive — uses system dialogs)
-    crop.py FOLDER AI_NUM NAME                    (AI one-shot)
-    crop.py --ugc FOLDER C_NUM CONCEPT CREATOR AWARENESS [FORMAT] [PRODUCT]
+    crop.py                        (interactive — uses system dialogs)
+    crop.py [--dry-run] --creative FOLDER ID AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT
+    crop.py --undo FOLDER          (CREATOR may be an empty string)
 """
 
 import json
@@ -63,7 +68,6 @@ FFMPEG_CANDIDATES_WIN = [
 
 AWARENESS_STAGES = ["Problem Aware", "Solution Aware", "Product Aware"]
 DEFAULT_PRODUCT = "Umwandler"
-DEFAULT_FORMAT = ""
 # One worker is the robust default: each ffmpeg encode already uses ~all CPU
 # cores, so parallel encodes mostly fight over the same cores. On long clips
 # extra workers hurt a lot (4x82s clip: 48s at 1 worker vs 107s at 4); on short
@@ -90,19 +94,6 @@ def transliterate(s: str) -> str:
         s = s.replace(k, v)
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-
-def normalize_concept(value: str) -> str:
-    """'21' or 'K21' or 'k21' → 'K21'. Anything else is returned trimmed."""
-    v = (value or "").strip()
-    if not v:
-        return v
-    m = re.match(r"^[Kk]\s*(\d+)$", v)
-    if m:
-        return f"K{m.group(1)}"
-    if v.isdigit():
-        return f"K{v}"
-    return v
 
 
 def normalize_creator(value: str) -> str:
@@ -142,15 +133,14 @@ def find_ffmpeg():
     return None
 
 
-def detect_from_folder_name(folder_name: str):
-    """Returns ('AI', '63'), ('UGC', '807'), or (None, None)."""
-    m = re.search(r"\bAI[\s_-]*(\d+)\b", folder_name, re.IGNORECASE)
+def detect_creative_id(folder_name: str):
+    """Leading letter prefix + number, kept verbatim:
+    'A10' → 'A10', 'AI63' → 'AI63', 'C807'/'C807-1' → 'C807', 'Cr906' → 'Cr906';
+    else None."""
+    m = re.match(r"\s*([A-Za-z]{1,4})[\s_-]*(\d+)", folder_name)
     if m:
-        return "AI", m.group(1)
-    m = re.search(r"\bC[\s_-]*(\d+)(?:[\s_-]*\d+)?\b", folder_name, re.IGNORECASE)
-    if m:
-        return "UGC", m.group(1)
-    return None, None
+        return f"{m.group(1)}{m.group(2)}"
+    return None
 
 
 def crop_to_4x5(src: Path, dst: Path, ffmpeg: str):
@@ -174,25 +164,24 @@ def crop_to_4x5(src: Path, dst: Path, ffmpeg: str):
 
 
 # ── Naming ────────────────────────────────────────────────────────────────────
-def _strip_letter_prefix(v: str, letters: str) -> str:
-    """'AI47' / 'ai 47' / '47' → '47'.  letters='AI' or 'C'."""
-    m = re.match(rf"^\s*(?:{letters})?\s*(\d+)\s*$", v or "", re.IGNORECASE)
-    return m.group(1) if m else (v or "").strip()
+def normalize_creative_id(value: str) -> str:
+    """A bare number defaults to a C id: '857' → 'C857'. Anything starting with
+    a letter (C893, AI78, Cr906…) is kept verbatim."""
+    v = (value or "").strip()
+    if v and v[0].isdigit():
+        return f"C{v}"
+    return v
 
 
-def ai_name(aspect: str, ai_num: str, i: int, name: str, cta: str = "") -> str:
-    ai_num = _strip_letter_prefix(ai_num, "AI")
+def creative_name(aspect: str, creative_id: str, i: int, *, ad_format: str,
+                  avatar: str, creator: str, awareness: str, product: str,
+                  cta: str = "") -> str:
+    """The shared AI/UGC convention. `creative_id` is the full id (C893, AI78,
+    Cr906…), used verbatim. `creator` is optional (AI creatives have none)."""
+    creator_part = f"_{creator}" if creator else ""
     cta_part = f"-{cta}" if cta else ""
-    return f"{aspect} - AI{ai_num}{cta_part}-{i} - {name}.mp4"
-
-
-def ugc_name(aspect: str, c_num: str, i: int, *, fmt: str, concept: str,
-             creator: str, awareness: str, product: str, cta: str = "") -> str:
-    c_num = _strip_letter_prefix(c_num, "C")
-    cta_part = f"-{cta}" if cta else ""
-    fmt_part = f"{fmt} - " if fmt else ""
     return (
-        f"{fmt_part}{concept} - {aspect}_{creator}_C{c_num}{cta_part}-{i} "
+        f"{ad_format} - {avatar} - {aspect}{creator_part}_{creative_id}{cta_part}-{i} "
         f"- {awareness} - {product}.mp4"
     )
 
@@ -219,7 +208,7 @@ def _build_index_pattern(name_for, cta: str) -> "re.Pattern[str]":
 
 def process_folder(folder: Path, name_for, ffmpeg: str, cta: str = "",
                    workers: int = 1, dry_run: bool = False,
-                   actions: list = None):
+                   actions: list = None, on_action=None):
     nine16 = folder / "9x16"
     four5 = folder / "4x5"
     files = [f for f in nine16.iterdir() if f.suffix.lower() == ".mp4"]
@@ -281,6 +270,8 @@ def process_folder(folder: Path, name_for, ffmpeg: str, cta: str = "",
                         "from": vid.name,
                         "to": n9,
                     })
+                    if on_action:
+                        on_action()
         if p4.exists():
             print(f"{indent}[{pos}/{total}] 4x5 already exists — skipping")
             continue
@@ -300,6 +291,8 @@ def process_folder(folder: Path, name_for, ffmpeg: str, cta: str = "",
         safe_print(f"{indent}[{pos}/{total}] ✓ {p4.name}")
         if actions is not None:
             actions.append({"type": "create", "path": str(p4)})
+            if on_action:
+                on_action()
 
     if dry_run or workers <= 1 or len(jobs) == 1:
         for job in jobs:
@@ -351,22 +344,17 @@ def _save_log(folder: Path, data: dict):
     )
 
 
-def run(folder: Path, mode: str, fields: dict, ffmpeg: str,
+def run(folder: Path, fields: dict, ffmpeg: str,
         workers: int = DEFAULT_WORKERS, dry_run: bool = False,
-        actions: list = None) -> list:
+        actions: list = None, on_action=None) -> list:
     if actions is None:
         actions = []
-    if mode == "AI":
-        name_for = lambda aspect, i, cta: ai_name(
-            aspect, fields["ai_num"], i, fields["name"], cta=cta
-        )
-    else:
-        name_for = lambda aspect, i, cta: ugc_name(
-            aspect, fields["c_num"], i,
-            fmt=fields["format"], concept=fields["concept"],
-            creator=fields["creator"], awareness=fields["awareness"],
-            product=fields["product"], cta=cta,
-        )
+    name_for = lambda aspect, i, cta: creative_name(
+        aspect, fields["creative_id"], i,
+        ad_format=fields["ad_format"], avatar=fields["avatar"],
+        creator=fields["creator"], awareness=fields["awareness"],
+        product=fields["product"], cta=cta,
+    )
 
     structure = detect_structure(folder)
     print(f"Structure: {structure}")
@@ -376,7 +364,7 @@ def run(folder: Path, mode: str, fields: dict, ffmpeg: str,
     print()
     if structure == "simple":
         process_folder(folder, name_for, ffmpeg, workers=workers,
-                       dry_run=dry_run, actions=actions)
+                       dry_run=dry_run, actions=actions, on_action=on_action)
     else:
         cta_subs = sorted(
             d for d in folder.iterdir()
@@ -385,7 +373,7 @@ def run(folder: Path, mode: str, fields: dict, ffmpeg: str,
         for cta_dir in cta_subs:
             process_folder(cta_dir, name_for, ffmpeg,
                            cta=cta_dir.name.upper(), workers=workers,
-                           dry_run=dry_run, actions=actions)
+                           dry_run=dry_run, actions=actions, on_action=on_action)
     return actions
 
 
@@ -563,55 +551,38 @@ def interactive(workers: int = DEFAULT_WORKERS):
         alert(f"Folder not found: {folder_path}")
         sys.exit(1)
 
-    detected_mode, detected_num = detect_from_folder_name(folder_path.name)
+    detected_id = detect_creative_id(folder_path.name)
 
-    # AI{n} is unambiguous. C{n} could be either AI or UGC, so always ask.
-    if detected_mode == "AI":
-        mode = "AI"
-    else:
-        default = detected_mode or "AI"
-        mode = _require(ask_choice("Creative type:", ["AI", "UGC"], default=default))
+    creative_id = _require(ask_text(
+        "Creative id (e.g. C857 or AI78):", default=detected_id or ""))
+    if not creative_id.strip():
+        _bail()
+    ad_format = _require(ask_text("Ad format Kürzel (e.g. UGC):"))
+    if not ad_format.strip():
+        _bail()
+    avatar = _require(ask_text("Avatar Kürzel (e.g. GeGe):"))
+    if not avatar.strip():
+        _bail()
+    # Creator is optional — AI creatives have none. Empty answer is allowed.
+    creator = normalize_creator(_require(ask_text(
+        "Creator (optional, e.g. Marco Schlegelmilch):")))
+    awareness = _require(ask_choice(
+        "Awareness stage:", AWARENESS_STAGES, default="Problem Aware"
+    ))
+    product = _require(ask_text("Product:", default=DEFAULT_PRODUCT))
+    if not product.strip():
+        _bail()
+    fields = {
+        "creative_id": creative_id.strip(),
+        "ad_format": ad_format.strip(), "avatar": avatar.strip(),
+        "creator": creator, "awareness": awareness.strip(),
+        "product": product.strip(),
+    }
 
-    if mode == "AI":
-        ai_num = _require(ask_text("AI number (e.g. 63):", default=detected_num or ""))
-        if not ai_num.strip():
-            _bail()
-        name = _require(ask_text("Creative name (e.g. Pharmacist):"))
-        if not name.strip():
-            _bail()
-        fields = {"ai_num": ai_num.strip(), "name": name.strip()}
-    else:
-        c_num = _require(ask_text("C number (e.g. 807):", default=detected_num or ""))
-        if not c_num.strip():
-            _bail()
-        concept = _require(ask_text("Concept (e.g. K21):"))
-        concept = normalize_concept(concept)
-        if not concept:
-            _bail()
-        creator = _require(ask_text("Creator (e.g. Sandra Lung):"))
-        creator = normalize_creator(creator)
-        if not creator:
-            _bail()
-        fmt = _require(ask_text("Format (e.g. UGC, IA, MVSL):", default=DEFAULT_FORMAT))
-        fmt = fmt.strip()
-        if not fmt:
-            _bail()
-        awareness = _require(ask_choice(
-            "Awareness stage:", AWARENESS_STAGES, default="Product Aware"
-        ))
-        product = _require(ask_text("Product:", default=DEFAULT_PRODUCT))
-        if not product.strip():
-            _bail()
-        fields = {
-            "c_num": c_num.strip(), "concept": concept,
-            "creator": creator, "format": fmt,
-            "awareness": awareness.strip(), "product": product.strip(),
-        }
-
-    run_with(folder_path, mode, fields, workers=workers)
+    run_with(folder_path, fields, workers=workers)
 
 
-def run_with(folder: Path, mode: str, fields: dict,
+def run_with(folder: Path, fields: dict,
              workers: int = DEFAULT_WORKERS, dry_run: bool = False):
     if not folder.is_dir():
         print(f"Folder not found: {folder}")
@@ -623,36 +594,51 @@ def run_with(folder: Path, mode: str, fields: dict,
         print(f"FFmpeg not found. Install it first:\n  {hint}")
         sys.exit(1)
 
-    print(f"Folder : {folder}")
-    print(f"Mode   : {mode}")
-    if mode == "AI":
-        print(f"AI num : {fields['ai_num']}")
-        print(f"Name   : {fields['name']}")
-    else:
-        print(f"C num     : {fields['c_num']}")
-        print(f"Concept   : {fields['concept']}")
-        print(f"Creator   : {fields['creator']}")
-        print(f"Format    : {fields['format']}")
-        print(f"Awareness : {fields['awareness']}")
-        print(f"Product   : {fields['product']}")
-    print(f"FFmpeg : {ffmpeg}\n")
+    fields = {**fields, "creative_id": normalize_creative_id(fields["creative_id"])}
+    print(f"Folder    : {folder}")
+    print(f"Id        : {fields['creative_id']}")
+    print(f"Ad format : {fields['ad_format']}")
+    print(f"Avatar    : {fields['avatar']}")
+    print(f"Creator   : {fields['creator'] or '(none)'}")
+    print(f"Awareness : {fields['awareness']}")
+    print(f"Product   : {fields['product']}")
+    print(f"FFmpeg    : {ffmpeg}\n")
 
+    # Persist the undo log INCREMENTALLY — after every rename/crop — not just at
+    # the end. The GUI's Stop hard-kills this process (SIGKILL), which skips any
+    # finally/atexit, so an end-only save would lose the record of files we
+    # already renamed and undo would find nothing. Flushing per action means a
+    # kill still leaves an accurate, replayable log.
     actions: list = []
+    log = _load_log(folder)
+    entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "fields": fields,
+        "actions": actions,
+    }
+    state = {"added": False}
+    log_lock = threading.Lock()
+
+    def flush():
+        if dry_run:
+            return
+        with log_lock:
+            snapshot = list(actions)   # stable copy (workers may be appending)
+            if not snapshot:
+                return
+            entry["actions"] = snapshot
+            if not state["added"]:
+                log.setdefault("runs", []).append(entry)
+                state["added"] = True
+            _save_log(folder, log)
+
     try:
-        run(folder, mode, fields, ffmpeg, workers=workers,
-            dry_run=dry_run, actions=actions)
+        run(folder, fields, ffmpeg, workers=workers,
+            dry_run=dry_run, actions=actions, on_action=flush)
         print("\n✓ All done!" if not dry_run else "\n✓ Preview done — no files changed.")
     finally:
-        # Always persist what we managed to do, so undo still works after a crash.
+        flush()
         if not dry_run and actions:
-            log = _load_log(folder)
-            log.setdefault("runs", []).append({
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "mode": mode,
-                "fields": fields,
-                "actions": actions,
-            })
-            _save_log(folder, log)
             print(f"  (saved {len(actions)} action(s) to {LOG_FILENAME} for undo)")
 
 
@@ -682,25 +668,20 @@ def main():
         undo_last(Path(args[1]).expanduser().resolve())
         return
 
-    if args and args[0] == "--ugc":
-        if len(args) < 6:
-            print("Usage: crop.py --ugc FOLDER C_NUM CONCEPT CREATOR AWARENESS [FORMAT] [PRODUCT]")
+    if args and args[0] == "--creative":
+        if len(args) < 8:
+            print("Usage: crop.py --creative FOLDER ID "
+                  "AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT")
             sys.exit(2)
         fields = {
-            "c_num": args[2].strip(),
-            "concept": normalize_concept(args[3]),
-            "creator": normalize_creator(args[4]),
-            "awareness": args[5].strip(),
-            "format": (args[6] if len(args) > 6 else DEFAULT_FORMAT).strip(),
-            "product": (args[7] if len(args) > 7 else DEFAULT_PRODUCT).strip(),
+            "creative_id": args[2].strip(),
+            "ad_format": args[3].strip(),
+            "avatar": args[4].strip(),
+            "creator": normalize_creator(args[5]),
+            "awareness": args[6].strip(),
+            "product": args[7].strip() or DEFAULT_PRODUCT,
         }
-        run_with(Path(args[1]).expanduser().resolve(), "UGC", fields,
-                 workers=workers, dry_run=dry_run)
-        return
-
-    if len(args) == 3:
-        fields = {"ai_num": args[1], "name": args[2]}
-        run_with(Path(args[0]).expanduser().resolve(), "AI", fields,
+        run_with(Path(args[1]).expanduser().resolve(), fields,
                  workers=workers, dry_run=dry_run)
         return
 
