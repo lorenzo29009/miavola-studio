@@ -88,7 +88,25 @@ if [ -d ./venv ]; then
 fi
 
 echo ">> Creating ./venv..."
-"$PYBIN" -m venv venv
+# Some Python builds (notably Homebrew's, which `brew install ffmpeg` may have
+# just pulled in) ship a broken `ensurepip`, so a plain `python -m venv` dies
+# with "ensurepip ... returned non-zero exit status 1". If that happens, build
+# the venv WITHOUT pip and bootstrap pip ourselves below — works regardless of
+# why ensurepip failed.
+if ! "$PYBIN" -m venv venv; then
+    echo ">> venv pip-bootstrap (ensurepip) failed — retrying without pip..."
+    rm -rf ./venv
+    "$PYBIN" -m venv --without-pip venv
+fi
+
+# Make sure pip is actually present (it won't be after --without-pip, and a
+# half-broken ensurepip can leave it missing even on the normal path).
+if ! ./venv/bin/python -m pip --version >/dev/null 2>&1; then
+    echo ">> Bootstrapping pip via get-pip.py..."
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/mariposa-get-pip.py
+    ./venv/bin/python /tmp/mariposa-get-pip.py
+    rm -f /tmp/mariposa-get-pip.py
+fi
 
 echo ">> Upgrading pip..."
 ./venv/bin/python -m pip install --upgrade pip wheel setuptools

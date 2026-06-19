@@ -85,7 +85,18 @@ def make_venv():
               "(WhisperX needs 3.10–3.12) — recreating it...")
         shutil.rmtree(venv_path, ignore_errors=True)
     print(f"Creating venv at {venv_path}...")
-    subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
+    try:
+        subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
+    except subprocess.CalledProcessError:
+        # Some Python builds ship a broken ensurepip, so `python -m venv` dies
+        # bootstrapping pip. Build the venv without pip and bootstrap it below.
+        print("venv pip-bootstrap (ensurepip) failed — retrying without pip...")
+        shutil.rmtree(venv_path, ignore_errors=True)
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv_path)],
+            check=True,
+        )
+    _ensure_pip(venv_path)
     return venv_path
 
 
@@ -93,6 +104,21 @@ def venv_python(venv_path: Path) -> Path:
     if platform.system() == "Windows":
         return venv_path / "Scripts" / "python.exe"
     return venv_path / "bin" / "python"
+
+
+def _ensure_pip(venv_path: Path):
+    """Guarantee pip exists in the venv (it won't after --without-pip, and a
+    half-broken ensurepip can leave it missing). Bootstrap via get-pip.py."""
+    py = venv_python(venv_path)
+    if subprocess.run([str(py), "-m", "pip", "--version"],
+                      capture_output=True).returncode == 0:
+        return
+    print("Bootstrapping pip via get-pip.py...")
+    import urllib.request
+    get_pip = venv_path / "get-pip.py"
+    urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip)
+    subprocess.run([str(py), str(get_pip)], check=True)
+    get_pip.unlink(missing_ok=True)
 
 
 def install_whisperx(venv_path: Path):
