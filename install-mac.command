@@ -44,8 +44,19 @@ if ! command -v brew >/dev/null 2>&1; then
     fi
 fi
 
-# ---- Pick a Python that PySide6 supports (3.10 – 3.13) -------------------
+# A usable interpreter must actually load its core C-extension stdlib. A broken
+# Homebrew python@3.12 revision shipped a `pyexpat` linked against the OLD system
+# libexpat, so `import xml.parsers.expat` crashes with
+#   "Symbol not found: _XML_SetAllocTrackerActivationThreshold"
+# which then takes down pip/get-pip (it imports xmlrpc -> expat). Reject such an
+# interpreter instead of building a doomed venv on top of it.
+py_core_ok() {  # $1 = interpreter
+    "$1" -c 'import xml.parsers.expat, ssl, ctypes' >/dev/null 2>&1
+}
+
+# ---- Pick a Python that PySide6 supports (3.10 – 3.13) AND actually works ----
 PYBIN=""
+SAW_BROKEN_PY=""
 for candidate in python3.13 python3.12 python3.11 python3.10 \
                  /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
                  /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
@@ -57,16 +68,39 @@ for candidate in python3.13 python3.12 python3.11 python3.10 \
         ver=$("$candidate" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "")
         case "$ver" in
             3.10|3.11|3.12|3.13)
-                PYBIN="$candidate"; break ;;
+                if py_core_ok "$candidate"; then
+                    PYBIN="$candidate"; break
+                else
+                    echo ">> Skipping $candidate — its core stdlib (xml/expat) won't load (broken install)."
+                    SAW_BROKEN_PY="$candidate"
+                fi ;;
         esac
     fi
 done
 
 if [ -z "$PYBIN" ]; then
     echo ""
-    echo ">> No usable Python found. Installing python@3.12 via Homebrew..."
-    brew install python@3.12
+    if [ -n "$SAW_BROKEN_PY" ]; then
+        # A Python is installed but broken — almost always Homebrew's python@3.12
+        # mis-linked against expat. Relink/rebuild expat + python, then retry.
+        echo ">> Found a broken Python ($SAW_BROKEN_PY). Repairing via Homebrew (expat + python)..."
+        brew update || true
+        brew reinstall expat 2>/dev/null || true
+        brew reinstall python@3.12 2>/dev/null || brew install python@3.12 || true
+    else
+        echo ">> No usable Python found. Installing python@3.12 via Homebrew..."
+        brew install python@3.12
+    fi
     PYBIN="$(brew --prefix)/bin/python3.12"
+fi
+
+if ! py_core_ok "$PYBIN"; then
+    echo ""
+    echo "!! The Python at $PYBIN is still broken (its xml/expat module won't load)."
+    echo "   This is usually a Homebrew linking problem. Fix it manually with:"
+    echo "       brew update && brew reinstall expat python@3.12"
+    echo "   then re-run this installer."
+    exit 1
 fi
 
 echo ""
@@ -165,12 +199,20 @@ else
                      /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.10; do
         if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
             v=$("$candidate" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "")
-            case "$v" in 3.10|3.11|3.12) WX_PY="$candidate"; break ;; esac
+            case "$v" in 3.10|3.11|3.12)
+                if py_core_ok "$candidate"; then WX_PY="$candidate"; break; fi ;;
+            esac
         fi
     done
+    if [ -z "$WX_PY" ] && py_core_ok "$PYBIN"; then
+        # The app interpreter we already validated above is 3.10–3.13; reuse it
+        # for WhisperX too if it's in range (3.10–3.12).
+        pv=$("$PYBIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "")
+        case "$pv" in 3.10|3.11|3.12) WX_PY="$PYBIN" ;; esac
+    fi
     if [ -z "$WX_PY" ]; then
-        echo ">> No Python 3.10–3.12 found; installing python@3.12 for WhisperX..."
-        brew install python@3.12
+        echo ">> No working Python 3.10–3.12 found; installing python@3.12 for WhisperX..."
+        brew reinstall python@3.12 2>/dev/null || brew install python@3.12
         WX_PY="$(brew --prefix)/bin/python3.12"
     fi
     echo ">> Setting up WhisperX with $WX_PY  ($("$WX_PY" --version 2>&1))"
