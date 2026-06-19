@@ -7,6 +7,16 @@ scripts via `QProcess`.
 
 Read this first so you can orient without re-exploring the whole tree.
 
+## Release notes & commit messages — keep them vague (MANDATORY)
+
+User-facing release notes AND git commit messages must always be **vague,
+generic, and in English** — never expose internal details, root causes, file
+names, stack traces, or which user/machine hit a bug. One short line is the
+goal, e.g. `Fixed a bug in the installer.`, `Performance improvements.`,
+`Minor fixes and improvements.`. This applies to every release and every commit,
+including the GitHub Release body attached to a tag. Do not add changelogs,
+bullet lists of changes, or technical explanations to release notes.
+
 ## Where things live
 
 ```
