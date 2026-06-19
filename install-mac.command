@@ -44,20 +44,29 @@ if ! command -v brew >/dev/null 2>&1; then
     fi
 fi
 
-# A usable interpreter must actually load its core C-extension stdlib. A broken
-# Homebrew python@3.12 revision shipped a `pyexpat` linked against the OLD system
-# libexpat, so `import xml.parsers.expat` crashes with
+# A usable interpreter must actually load its core C-extension stdlib. Some
+# Homebrew python@3.12 bottles ship a `pyexpat` linked against the SYSTEM
+# /usr/lib/libexpat.1.dylib and built on a NEWER macOS, so on an older macOS
+# `import xml.parsers.expat` crashes with
 #   "Symbol not found: _XML_SetAllocTrackerActivationThreshold"
-# which then takes down pip/get-pip (it imports xmlrpc -> expat). Reject such an
-# interpreter instead of building a doomed venv on top of it.
+# (then takes down pip/get-pip, which imports xmlrpc -> expat). `brew reinstall`
+# can't fix it — it re-fetches the same mismatched bottle. The reliable fix is a
+# Python whose pyexpat vendors expat statically (python.org / pyenv), so we reject
+# a broken interpreter and steer the user there instead of building a doomed venv.
 py_core_ok() {  # $1 = interpreter
     "$1" -c 'import xml.parsers.expat, ssl, ctypes' >/dev/null 2>&1
 }
+
+# python.org installs to /Library/Frameworks (and symlinks /usr/local/bin); its
+# pyexpat is statically built, so it's immune to the system-libexpat mismatch.
+PYORG=/Library/Frameworks/Python.framework/Versions
 
 # ---- Pick a Python that PySide6 supports (3.10 – 3.13) AND actually works ----
 PYBIN=""
 SAW_BROKEN_PY=""
 for candidate in python3.13 python3.12 python3.11 python3.10 \
+                 "$PYORG/3.13/bin/python3.13" "$PYORG/3.12/bin/python3.12" \
+                 "$PYORG/3.11/bin/python3.11" "$PYORG/3.10/bin/python3.10" \
                  /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
                  /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
                  /usr/local/bin/python3.13 /usr/local/bin/python3.12 \
@@ -78,28 +87,32 @@ for candidate in python3.13 python3.12 python3.11 python3.10 \
     fi
 done
 
-if [ -z "$PYBIN" ]; then
+if [ -z "$PYBIN" ] && [ -z "$SAW_BROKEN_PY" ]; then
+    # Nothing installed at all — a fresh Homebrew python is fine here (a clean
+    # bottle for this OS won't have the mismatch).
     echo ""
-    if [ -n "$SAW_BROKEN_PY" ]; then
-        # A Python is installed but broken — almost always Homebrew's python@3.12
-        # mis-linked against expat. Relink/rebuild expat + python, then retry.
-        echo ">> Found a broken Python ($SAW_BROKEN_PY). Repairing via Homebrew (expat + python)..."
-        brew update || true
-        brew reinstall expat 2>/dev/null || true
-        brew reinstall python@3.12 2>/dev/null || brew install python@3.12 || true
-    else
-        echo ">> No usable Python found. Installing python@3.12 via Homebrew..."
-        brew install python@3.12
-    fi
+    echo ">> No usable Python found. Installing python@3.12 via Homebrew..."
+    brew install python@3.12 || true
     PYBIN="$(brew --prefix)/bin/python3.12"
 fi
 
 if ! py_core_ok "$PYBIN"; then
     echo ""
-    echo "!! The Python at $PYBIN is still broken (its xml/expat module won't load)."
-    echo "   This is usually a Homebrew linking problem. Fix it manually with:"
-    echo "       brew update && brew reinstall expat python@3.12"
-    echo "   then re-run this installer."
+    echo "!! Couldn't find a working Python 3.10–3.13 on this Mac."
+    if [ -n "$SAW_BROKEN_PY" ]; then
+        echo "   The one that's installed ($SAW_BROKEN_PY) is broken: its xml/expat"
+        echo "   module won't load (a Homebrew bottle built for a newer macOS than"
+        echo "   yours). 'brew reinstall' won't fix this — it re-fetches the same build."
+    fi
+    echo ""
+    echo "   Fix (2 minutes, one-time):"
+    echo "     1. Download the macOS 64-bit universal2 installer for Python 3.12 from:"
+    echo "          https://www.python.org/downloads/macos/"
+    echo "     2. Run the .pkg (Continue → Agree → Install)."
+    echo "     3. Double-click 'install-mac.command' again — it'll pick up that Python."
+    echo ""
+    echo "   (python.org's Python bundles its own expat, so it works on any macOS"
+    echo "    version — unlike the mismatched Homebrew bottle.)"
     exit 1
 fi
 
@@ -195,6 +208,7 @@ else
     # so pin the range explicitly instead of taking the first python3 found.
     WX_PY=""
     for candidate in python3.12 python3.11 python3.10 \
+                     "$PYORG/3.12/bin/python3.12" "$PYORG/3.11/bin/python3.11" "$PYORG/3.10/bin/python3.10" \
                      /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
                      /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.10; do
         if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
