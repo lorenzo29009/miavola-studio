@@ -474,7 +474,7 @@ class FlowCropperPage(ToolPage):
         mode_row = QHBoxLayout(); mode_row.setSpacing(12)
         mode_row.addWidget(self.group_label("FILL FIELDS"))
         mode_row.addStretch(1)
-        self.input_mode = Segmented(["Auto", "Manual"])
+        self.input_mode = Segmented(["Auto", "Manual", "Simple"])
         self.input_mode.currentChanged.connect(
             lambda _i: self._update_visibility(self.input_mode.currentText()))
         mode_row.addWidget(self.input_mode)
@@ -517,6 +517,15 @@ class FlowCropperPage(ToolPage):
             Field("Awareness", self.awareness), Field("Product", self.product),
         ])
         lay.addWidget(self.fields_group)
+
+        # Simple field set — the short, old convention:
+        #   {ratio} - {creative id}[-{CTA}]-{hook} - {format}
+        self.simple_num = QLineEdit(); self.simple_num.setPlaceholderText("e.g. AI63")
+        self.simple_fmt = QLineEdit(); self.simple_fmt.setPlaceholderText("e.g. Pharmacist")
+        self.simple_group = self.grid_2col([
+            Field("Creative id", self.simple_num), Field("Format", self.simple_fmt),
+        ])
+        lay.addWidget(self.simple_group)
 
         self._update_visibility(self.input_mode.currentText())
 
@@ -565,11 +574,11 @@ class FlowCropperPage(ToolPage):
         proc.start(program, args)
 
     def _update_visibility(self, mode: str):
-        # Auto = just the paste box; Manual = just the form. Never both.
-        is_auto = (mode == "Auto")
-        self.tag_field.setVisible(is_auto)
-        self.tag_hint.setVisible(is_auto)
-        self.fields_group.setVisible(not is_auto)
+        # Exactly one of the three field sets is visible at a time.
+        self.tag_field.setVisible(mode == "Auto")
+        self.tag_hint.setVisible(mode == "Auto")
+        self.fields_group.setVisible(mode == "Manual")
+        self.simple_group.setVisible(mode == "Simple")
 
     @staticmethod
     def _parse_tag(tag: str) -> Optional[dict]:
@@ -650,6 +659,8 @@ class FlowCropperPage(ToolPage):
         creative_id = f"{m.group(1)}{m.group(2)}"
         if not self.num.text().strip():
             self.num.setText(creative_id)
+        if not self.simple_num.text().strip():
+            self.simple_num.setText(creative_id)
         # AI campaigns have no Notion briefing tag, so jump straight to Manual.
         # Segmented.setCurrentText doesn't emit currentChanged, so refresh the
         # form visibility ourselves.
@@ -664,7 +675,12 @@ class FlowCropperPage(ToolPage):
             return "The campaign folder doesn't exist."
         if not (FLOW_CROPPER_DIR / "crop.py").exists():
             return f"crop.py not found in {FLOW_CROPPER_DIR}"
-        if self.input_mode.currentText() == "Auto" and not self._parse_tag(self.tag.text().strip()):
+        mode = self.input_mode.currentText()
+        if mode == "Simple":
+            if not all([self.simple_num.text().strip(), self.simple_fmt.text().strip()]):
+                return "Simple mode needs a Creative id and a Format."
+            return None
+        if mode == "Auto" and not self._parse_tag(self.tag.text().strip()):
             return "Couldn't read the pasted tag. Fix it, or switch to Manual."
         # Creator is optional (AI has none); id, ad format and avatar are required.
         if not all([self.num.text().strip(), self.ad_format.currentData(),
@@ -674,7 +690,6 @@ class FlowCropperPage(ToolPage):
         return None
 
     def build_command(self):
-        self._normalize_id()
         py = studio_python()
         script = str(FLOW_CROPPER_DIR / "crop.py")
         # No --workers flag: crop.py defaults to 1 (one ffmpeg already saturates
@@ -682,6 +697,12 @@ class FlowCropperPage(ToolPage):
         args = ["-u", script]
         if self.preview.isChecked():   # dry-run toggle
             args.append("--dry-run")
+        if self.input_mode.currentText() == "Simple":
+            # Old short convention: {ratio} - {id}[-{CTA}]-{hook} - {format}
+            args += ["--simple", self.folder.value(),
+                     self.simple_num.text().strip(), self.simple_fmt.text().strip()]
+            return py, args, FLOW_CROPPER_DIR
+        self._normalize_id()
         product = self.product.text().strip() or "Umwandler"
         # crop.py takes the id verbatim and the Kürzel codes; creator may be "".
         args += ["--creative", self.folder.value(), self.num.text().strip(),

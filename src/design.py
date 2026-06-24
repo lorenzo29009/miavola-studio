@@ -541,18 +541,19 @@ QToolButton#GearBtn {{
 }}
 QToolButton#GearBtn:hover {{ border-color: {GREEN_LINE}; background: {PAPER_CARD2}; }}
 
-/* ---- Segmented mode toggle — free-floating pill chips, reference style ---- */
+/* ---- Segmented mode toggle — one cohesive track, native segmented style ---- */
 QFrame#ModeToggle {{
-    background: transparent;
-    border: none;
+    background: {PAPER_CARD2};
+    border: 1px solid {PAPER_LINE2};
+    border-radius: 13px;
 }}
 QPushButton#ModeBtn {{
-    background: {PAPER_CARD}; border: 1px solid {PAPER_LINE2}; color: {TXT_DIM};
-    padding: 0 20px; min-height: 36px; border-radius: 18px;
+    background: transparent; border: none; color: {TXT_DIM};
+    padding: 0 18px; min-height: 30px; border-radius: 10px;
     font-size: 12.5px; font-weight: 600;
 }}
-QPushButton#ModeBtn:hover {{ color: {TXT_HI}; border-color: {GREEN_LINE}; }}
-QPushButton#ModeBtn:checked {{ background: {GREEN}; color: {GREEN_FG}; border-color: {GREEN}; }}
+QPushButton#ModeBtn:hover {{ color: {TXT_HI}; }}
+QPushButton#ModeBtn:checked {{ background: {GREEN}; color: {GREEN_FG}; }}
 
 QPushButton#PillBtn {{
     background: {PAPER_CARD}; border: 1px solid {PAPER_LINE2}; color: {TXT_DIM};

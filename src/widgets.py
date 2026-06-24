@@ -226,15 +226,18 @@ class DropZone(QFrame):
 
 
 class Segmented(QFrame):
-    """A horizontal segmented control (exclusive). Mirrors the ModeToggle look."""
+    """A horizontal segmented control (exclusive): one cohesive track with the
+    selected segment filled — a native iOS/macOS-style switch."""
     currentChanged = Signal(int)
 
     def __init__(self, options: list[str], icons: Optional[list[str]] = None):
         super().__init__()
         self.setObjectName("ModeToggle")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)   # free-floating pill chips, not a fused segment bar
+        # A small inset all round + tight spacing makes the segments read as one
+        # connected control sitting inside a single track.
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(3)
         self._options = list(options)
         self._icons = list(icons) if icons else None
         self._group = QButtonGroup(self); self._group.setExclusive(True)

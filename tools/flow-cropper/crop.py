@@ -22,9 +22,14 @@ The creative id is auto-detected from the folder name:
     folder named "C807" / "C807-1" → id C807
     anything else                  → user is asked
 
+There is also a SHORT "simple" convention (the old one):
+    {aspect} - {id}[-{CTA}]-{i} - {format}.mp4
+e.g.  9x16 - AI63-2 - Pharmacist.mp4
+
 Usage:
     crop.py                        (interactive — uses system dialogs)
     crop.py [--dry-run] --creative FOLDER ID AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT
+    crop.py [--dry-run] --simple FOLDER ID FORMAT
     crop.py --undo FOLDER          (CREATOR may be an empty string)
 """
 
@@ -35,7 +40,6 @@ import re
 import subprocess
 import sys
 import threading
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -75,35 +79,15 @@ DEFAULT_PRODUCT = "Umwandler"
 # everywhere, so it's the safe default — the selector still offers 2-4.
 DEFAULT_WORKERS = 1
 
-# Non-decomposable characters that need an explicit mapping for transliteration.
-_TRANSLIT_EXTRA = {
-    "ß": "ss", "ẞ": "SS",
-    "ø": "o", "Ø": "O",
-    "æ": "ae", "Æ": "AE",
-    "œ": "oe", "Œ": "OE",
-    "đ": "d", "Đ": "D",
-    "ł": "l", "Ł": "L",
-}
-
-
-def transliterate(s: str) -> str:
-    """Replace accented/Umlauts/etc with plain ASCII equivalents."""
-    if not s:
-        return s
-    for k, v in _TRANSLIT_EXTRA.items():
-        s = s.replace(k, v)
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-
 def normalize_creator(value: str) -> str:
-    """Replaces spaces with underscores and strips accents/Umlauts."""
+    """Replaces runs of whitespace with single underscores, preserving the name
+    exactly otherwise. Accents/Umlauts/ß are kept verbatim ("Straßenumfrage",
+    "Königseder") — APFS and NTFS both store these fine, and the name round-trips
+    through the filename parser unchanged."""
     v = (value or "").strip()
     if not v:
         return v
-    v = transliterate(v)
-    v = re.sub(r"\s+", "_", v)
-    return v
+    return re.sub(r"\s+", "_", v)
 
 _PRINT_LOCK = threading.Lock()
 
@@ -184,6 +168,15 @@ def creative_name(aspect: str, creative_id: str, i: int, *, ad_format: str,
         f"{ad_format} - {avatar} - {aspect}{creator_part}_{creative_id}{cta_part}-{i} "
         f"- {awareness} - {product}.mp4"
     )
+
+
+def simple_name(aspect: str, creative_id: str, i: int, *, fmt: str,
+                cta: str = "") -> str:
+    """The old, short convention:
+        {aspect} - {id}[-{CTA}]-{i} - {format}.mp4
+    e.g.  9x16 - AI63-2 - Pharmacist.mp4  /  9x16 - AI63-CTA1-2 - Pharmacist.mp4"""
+    cta_part = f"-{cta}" if cta else ""
+    return f"{aspect} - {creative_id}{cta_part}-{i} - {fmt}.mp4"
 
 
 # ── Processing ────────────────────────────────────────────────────────────────
@@ -349,12 +342,17 @@ def run(folder: Path, fields: dict, ffmpeg: str,
         actions: list = None, on_action=None) -> list:
     if actions is None:
         actions = []
-    name_for = lambda aspect, i, cta: creative_name(
-        aspect, fields["creative_id"], i,
-        ad_format=fields["ad_format"], avatar=fields["avatar"],
-        creator=fields["creator"], awareness=fields["awareness"],
-        product=fields["product"], cta=cta,
-    )
+    if fields.get("mode") == "simple":
+        name_for = lambda aspect, i, cta: simple_name(
+            aspect, fields["creative_id"], i, fmt=fields["format"], cta=cta,
+        )
+    else:
+        name_for = lambda aspect, i, cta: creative_name(
+            aspect, fields["creative_id"], i,
+            ad_format=fields["ad_format"], avatar=fields["avatar"],
+            creator=fields["creator"], awareness=fields["awareness"],
+            product=fields["product"], cta=cta,
+        )
 
     structure = detect_structure(folder)
     print(f"Structure: {structure}")
@@ -419,9 +417,17 @@ def _osa(script: str):
 
 
 def _ps(script: str):
+    # Force the whole exchange through UTF-8. Without this, PowerShell writes its
+    # output to the redirected pipe using the OEM console code page (cp850 on
+    # most Windows), while Python's text=True decodes with the ANSI code page
+    # (cp1252) — so an "ö" (byte 0x94 in cp850) comes back as "”" (0x94 in
+    # cp1252) and ends up in the filename. Setting OutputEncoding on the
+    # PowerShell side and decoding as utf-8 here keeps accented creator names
+    # intact, so "Königseder" stays "Königseder" all the way to the filename.
+    script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + script
     r = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     if r.returncode != 0:
         return None
@@ -594,14 +600,21 @@ def run_with(folder: Path, fields: dict,
         print(f"FFmpeg not found. Install it first:\n  {hint}")
         sys.exit(1)
 
-    fields = {**fields, "creative_id": normalize_creative_id(fields["creative_id"])}
+    simple = fields.get("mode") == "simple"
+    # Bare-number → C default only applies to the full convention; the simple
+    # (old) convention keeps the creative id exactly as given (e.g. AI63).
+    if not simple:
+        fields = {**fields, "creative_id": normalize_creative_id(fields["creative_id"])}
     print(f"Folder    : {folder}")
     print(f"Id        : {fields['creative_id']}")
-    print(f"Ad format : {fields['ad_format']}")
-    print(f"Avatar    : {fields['avatar']}")
-    print(f"Creator   : {fields['creator'] or '(none)'}")
-    print(f"Awareness : {fields['awareness']}")
-    print(f"Product   : {fields['product']}")
+    if simple:
+        print(f"Format    : {fields['format']}")
+    else:
+        print(f"Ad format : {fields['ad_format']}")
+        print(f"Avatar    : {fields['avatar']}")
+        print(f"Creator   : {fields['creator'] or '(none)'}")
+        print(f"Awareness : {fields['awareness']}")
+        print(f"Product   : {fields['product']}")
     print(f"FFmpeg    : {ffmpeg}\n")
 
     # Persist the undo log INCREMENTALLY — after every rename/crop — not just at
@@ -668,12 +681,26 @@ def main():
         undo_last(Path(args[1]).expanduser().resolve())
         return
 
+    if args and args[0] == "--simple":
+        if len(args) < 4:
+            print("Usage: crop.py --simple FOLDER ID FORMAT")
+            sys.exit(2)
+        fields = {
+            "mode": "simple",
+            "creative_id": args[2].strip(),
+            "format": args[3].strip(),
+        }
+        run_with(Path(args[1]).expanduser().resolve(), fields,
+                 workers=workers, dry_run=dry_run)
+        return
+
     if args and args[0] == "--creative":
         if len(args) < 8:
             print("Usage: crop.py --creative FOLDER ID "
                   "AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT")
             sys.exit(2)
         fields = {
+            "mode": "full",
             "creative_id": args[2].strip(),
             "ad_format": args[3].strip(),
             "avatar": args[4].strip(),
