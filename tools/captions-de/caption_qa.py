@@ -141,19 +141,50 @@ BRIEFING (source of truth; contains stage directions to ignore):
 \"\"\"
 
 Return a JSON array (possibly empty) of findings, each an object:
-{{"caption": <int 0..{last}>, "type": "spelling"|"wrong-word"|"capitalization"|"missing"|"other", "suspect": "<the wrong word/phrase exactly as it appears in the caption>", "suggestion": "<the corrected/missing word, or null if unknown>", "confidence": "high"|"medium"|"low", "reason": "<short, why it looks wrong>"}}
+{{"caption": <int 0..{last}>, "type": "spelling"|"wrong-word"|"capitalization"|"missing"|"other", "suspect": "<the wrong word/phrase exactly as in the caption>", "suggestion": "<the corrected/missing word, or null>", "confidence": "high"|"medium"|"low", "reason": "<short, why it looks wrong>"}}
 Return ONLY the JSON array, nothing else."""
 
 
-def qa_check(captions: list, briefing: str, language: str = "de") -> list:
-    """Ask Gemini to flag likely mistranscriptions. Returns a cleaned list of
-    finding dicts (validated + clamped to real caption indices), or [] on no
-    findings / any failure."""
+def _build_omissions_prompt(captions: list, briefing: str, language: str) -> str:
+    listing = "\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+    last = len(captions) - 1
+    return f"""You compare a video's CAPTIONS (auto-transcribed from the voiceover) against the BRIEFING (the full script). Find COVERAGE GAPS: contiguous passages of clearly SPOKEN script content — a FULL SENTENCE or more — that are ENTIRELY ABSENT from the captions because the voiceover cut or skipped them.
+
+RULES:
+- Group adjacent skipped sentences into ONE entry.
+- IGNORE non-spoken stage directions (parenthetical notes, whiteboard layouts, editor instructions).
+- IGNORE minor dropped filler words and normal paraphrasing — report ONLY SUBSTANTIAL cut sections (a whole sentence or more) a human should confirm were cut on purpose.
+- If nothing substantial is missing, return an empty array.
+
+CAPTIONS (numbered):
+{listing}
+
+BRIEFING (full script):
+\"\"\"
+{briefing}
+\"\"\"
+
+Return ONLY a JSON array (possibly empty), each entry:
+{{"script": "<the omitted spoken passage, trimmed to ≤200 chars>", "after": <the caption index 0..{last} it would follow, or null>}}"""
+
+
+def qa_check(captions: list, briefing: str, language: str = "de") -> dict:
+    """Two FOCUSED Gemini passes (kept separate on purpose — combining them in one
+    prompt made the findings pass intermittently return nothing). Returns
+    {"findings": [...], "omissions": [...]}, both validated/guarded."""
     if not captions or not briefing.strip():
-        return []
+        return {"findings": [], "omissions": []}
+    return {
+        "findings": _check_findings(captions, briefing, language),
+        "omissions": _check_omissions(captions, briefing, language),
+    }
+
+
+def _check_findings(captions: list, briefing: str, language: str) -> list:
+    """Word-level mistranscription pass (spelling / wrong-word / casing / missing)."""
     data = caption._call_gemini(_build_qa_prompt(captions, briefing, language))
     if not isinstance(data, list):
-        print("QA pass: no usable response from Gemini.")
+        print("QA findings pass: no usable response from Gemini.")
         return []
 
     cleaned = []
@@ -210,6 +241,33 @@ def qa_check(captions: list, briefing: str, language: str = "de") -> list:
     return filtered
 
 
+def _check_omissions(captions: list, briefing: str, language: str) -> list:
+    """Coverage pass: substantial spoken sections of the script absent from the
+    captions. Guarded so a passage whose content is mostly already present is
+    dropped (the model occasionally 'omits' text that is in fact there)."""
+    data = caption._call_gemini(_build_omissions_prompt(captions, briefing, language))
+    if not isinstance(data, list):
+        return []
+    full_caps = " ".join(captions).lower()
+    omissions = []
+    for om in data:
+        if not isinstance(om, dict):
+            continue
+        script = (om.get("script") or "").strip()
+        if len(script) < 12:
+            continue  # too small to be a "section"
+        words = [w for w in re.findall(r"\w+", script.lower(), flags=re.UNICODE) if len(w) > 3]
+        if words and sum(1 for w in words if w in full_caps) / len(words) > 0.6:
+            continue  # mostly already present → not a real cut
+        try:
+            after = int(om.get("after"))
+            after = after if 0 <= after < len(captions) else None
+        except (TypeError, ValueError):
+            after = None
+        omissions.append({"script": script[:200], "after": after})
+    return omissions
+
+
 # --------------------------------------------------------------------------- #
 # CLI harness                                                                  #
 # --------------------------------------------------------------------------- #
@@ -243,20 +301,22 @@ def main() -> None:
         # corrupt it — route those to stderr while computing, then emit only JSON.
         import contextlib
         with contextlib.redirect_stdout(sys.stderr):
-            findings = qa_check(captions, briefing, language=args.language)
-        sys.stdout.write(_json.dumps({"cues": cues, "findings": findings}))
+            result = qa_check(captions, briefing, language=args.language)
+        sys.stdout.write(_json.dumps({"cues": cues, **result}))
         return
 
     print(f"Parsed {len(cues)} cues. Asking Gemini to flag mistranscriptions…\n")
 
-    findings = qa_check(captions, briefing, language=args.language)
-    if not findings:
+    result = qa_check(captions, briefing, language=args.language)
+    findings, omissions = result["findings"], result["omissions"]
+    if not findings and not omissions:
         print("No likely mistranscriptions flagged. ✅")
         return
 
     findings.sort(key=lambda f: (_CONF_ORDER.get(f["confidence"], 3),
                                  f["caption"] if f["caption"] is not None else 1e9))
-    print(f"{len(findings)} possible issue(s):\n")
+    if findings:
+        print(f"{len(findings)} possible issue(s):\n")
     for f in findings:
         ci = f["caption"]
         loc = f"#{cues[ci]['idx']} [{cues[ci]['start']}]" if ci is not None else "#?"
@@ -268,6 +328,13 @@ def main() -> None:
         print(f'         suspect : "{f["suspect"]}"{arrow}')
         if f["reason"]:
             print(f"         reason  : {f['reason']}")
+        print()
+
+    if omissions:
+        print(f"{len(omissions)} section(s) of the script not in the captions "
+              "(confirm the cut was intentional):\n")
+        for om in omissions:
+            print(f"  • {om['script']}")
         print()
 
 

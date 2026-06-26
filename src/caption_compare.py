@@ -43,11 +43,13 @@ _TYPE_STYLE = {
     "wrong-word":     (WARNING, "rgba(180, 83, 9, 0.12)"),
     "capitalization": ("#7C3AED", "rgba(124, 58, 237, 0.12)"),
     "missing":        ("#2563EB", "rgba(37, 99, 235, 0.12)"),
+    "omission":       ("#475569", "rgba(71, 85, 105, 0.10)"),
     "other":          (TXT_DIM, "rgba(103, 117, 108, 0.12)"),
 }
 _TYPE_LABEL = {
     "spelling": "Misspelled", "wrong-word": "Wrong word",
-    "capitalization": "Capitalization", "missing": "Missing word", "other": "Other",
+    "capitalization": "Capitalization", "missing": "Missing word",
+    "omission": "Not in captions", "other": "Other",
 }
 _CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -313,7 +315,7 @@ class ComparePanel(QWidget):
         except Exception:
             data = None
         if isinstance(data, dict) and "findings" in data:
-            self._render(data.get("cues", []), data["findings"])
+            self._render(data.get("cues", []), data["findings"], data.get("omissions", []))
             return
 
         # Something went wrong — say what, and how to resolve it.
@@ -358,9 +360,10 @@ class ComparePanel(QWidget):
         self.status.setStyleSheet(f"color:{color}; background:transparent; font-weight:600;")
 
     # ---- render results ----
-    def _render(self, cues: list, findings: list):
+    def _render(self, cues: list, findings: list, omissions: list = None):
+        omissions = omissions or []
         self._clear_results()
-        if not findings:
+        if not findings and not omissions:
             self.status.setText("Done — no likely issues.  ✓")
             self._set_status_tone("ok")
             self._show_placeholder("No likely issues found.  ✓")
@@ -368,16 +371,25 @@ class ComparePanel(QWidget):
 
         findings.sort(key=lambda f: (_CONF_ORDER.get(f.get("confidence"), 3),
                                      f["caption"] if f.get("caption") is not None else 10**9))
-        self.status.setText(f"Done — {len(findings)} possible issue"
-                            + ("" if len(findings) == 1 else "s") + ".")
+        parts = []
+        if findings:
+            parts.append(f"{len(findings)} issue" + ("" if len(findings) == 1 else "s"))
+        if omissions:
+            parts.append(f"{len(omissions)} cut section" + ("" if len(omissions) == 1 else "s"))
+        self.status.setText("Done — " + " · ".join(parts) + ".")
         self._set_status_tone("done")
 
         # summary chips by type → pinned in the run bar (right), not the scroll list
         counts: dict = {}
         for f in findings:
             counts[f["type"]] = counts.get(f["type"], 0) + 1
+        if omissions:
+            counts["omission"] = len(omissions)
         self._set_summary(counts)
 
+        # Coverage gaps first (informational), then the word-level findings.
+        if omissions:
+            self.results.addWidget(self._coverage_card(cues, omissions))
         for f in findings:
             self.results.addWidget(self._finding_card(cues, f))
         self.results.addStretch(1)
@@ -400,6 +412,38 @@ class ComparePanel(QWidget):
             if w:
                 w.setParent(None)
                 w.deleteLater()
+
+    def _coverage_card(self, cues: list, omissions: list) -> QWidget:
+        """One calm, informational card listing script sections absent from the
+        captions — a heads-up to confirm the cut was intentional, NOT a red error."""
+        fg, tint = _TYPE_STYLE["omission"]
+        card = QFrame()
+        card.setObjectName("FindingCard")
+        card.setStyleSheet(
+            f"QFrame#FindingCard {{ background:{PAPER_CARD}; border:1px solid {PAPER_LINE}; "
+            f"border-left:3px solid {fg}; border-radius:10px; }}")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(16, 12, 16, 14); lay.setSpacing(8)
+
+        top = QHBoxLayout(); top.setSpacing(8)
+        head = QLabel("Not in the captions")
+        head.setStyleSheet(f"color:{fg}; font-size:14px; font-weight:700; background:transparent;")
+        top.addWidget(head); top.addStretch(1)
+        tag = QLabel("confirm the cut was intentional")
+        tag.setStyleSheet(f"color:{TXT_FAINT}; font-size:11px; background:transparent;")
+        top.addWidget(tag)
+        lay.addLayout(top)
+
+        for om in omissions:
+            a = om.get("after")
+            loc = f"after #{cues[a]['idx']}  ·  " if isinstance(a, int) and 0 <= a < len(cues) else ""
+            q = QLabel(f'{loc}“{html.escape(om.get("script", ""))}”')
+            q.setWordWrap(True)
+            q.setStyleSheet(
+                f"color:{TXT_HI}; font-size:13px; background:{tint}; "
+                "border-radius:6px; padding:7px 10px;")
+            lay.addWidget(q)
+        return card
 
     def _finding_card(self, cues: list, f: dict) -> QWidget:
         fg, tint = _TYPE_STYLE.get(f["type"], _TYPE_STYLE["other"])
