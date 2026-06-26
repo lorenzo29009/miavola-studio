@@ -12,10 +12,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import (Qt, QProcess)
+from PySide6.QtCore import (Qt, QProcess, QEvent)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
     QComboBox, QFrame, QScrollArea, QGridLayout, QProgressBar,
+    QApplication, QPlainTextEdit,
 )
 
 from design import (
@@ -30,6 +31,7 @@ from core import (
 from widgets import (
     Card, FormRow, DropZone, Segmented, Field, ChipGroup, Switch, ConsoleView, AppBar, Select, _panel,
 )
+from caption_compare import ComparePanel  # EXPERIMENTAL: hidden "Compare .srt" QA overlay
 
 # ---------------------------------------------------------------------------
 # Tool page base — a "job runner" app: input → action → live status/results
@@ -56,6 +58,7 @@ class ToolPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        self._outer = outer   # so subclasses can add a full-body sibling (e.g. Compare)
 
         # ---- App bar with Home + primary action ----
         self.app_bar = AppBar(self.title, self.tool_key, on_back)
@@ -86,6 +89,7 @@ class ToolPage(QWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll, 1)
+        self.body_scroll = scroll   # hidden when a full-body panel takes over
 
         wrap = QWidget()
         scroll.setWidget(wrap)
@@ -838,6 +842,59 @@ class CaptionsPage(ToolPage):
             nl.addWidget(repair)
             self.add_widget(notice)
 
+        self._setup_compare()
+
+    # ---- EXPERIMENTAL: hidden "Compare .srt" QA view (reveal with U) ----
+    def _setup_compare(self):
+        self._last_srt: Optional[Path] = None
+        self._compare: Optional[ComparePanel] = None
+
+        self.compare_btn = QPushButton("  Compare .srt")
+        self.compare_btn.setObjectName("SecondaryBtn")
+        self.compare_btn.setCursor(Qt.PointingHandCursor)
+        self.compare_btn.setIcon(svg_icon("search", TXT_HI, 14))
+        self.compare_btn.setToolTip("Check the captions against the briefing")
+        self.compare_btn.setVisible(False)   # hidden until the user presses U
+        self.compare_btn.clicked.connect(self._open_compare)
+        self.app_bar.add_right(self.compare_btn)
+
+        # App-level filter so U toggles the button (and Esc closes the view)
+        # regardless of which child has focus — but never while typing in a field.
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.KeyPress and self.isVisible():
+            key = e.key()
+            if key == Qt.Key_U:
+                fw = QApplication.focusWidget()
+                if isinstance(fw, (QLineEdit, QPlainTextEdit, QComboBox)):
+                    return False  # let the keystroke type into the field
+                self.compare_btn.setVisible(not self.compare_btn.isVisible())
+                return True
+            if key == Qt.Key_Escape and self._compare is not None and self._compare.isVisible():
+                self._close_compare()
+                return True
+        return super().eventFilter(obj, e)
+
+    def _open_compare(self):
+        # Replace the Captions form with the Compare view (same app bar stays).
+        if self._compare is None:
+            self._compare = ComparePanel(self, on_close=self._close_compare)
+            self._outer.addWidget(self._compare, 1)
+            self._compare.hide()
+        self._compare.set_srt(self._last_srt)
+        self.body_scroll.hide()
+        self.run_btn.setVisible(False)       # the form's primary action is irrelevant here
+        self.compare_btn.setVisible(False)
+        self._compare.show()
+
+    def _close_compare(self):
+        if self._compare is not None:
+            self._compare.hide()
+        self.body_scroll.show()
+        self.run_btn.setVisible(True)
+        self.compare_btn.setVisible(True)    # keep it revealed for re-entry
+
     def _repair_whisperx(self):
         # Open the OS-appropriate WhisperX installer for the captions tool.
         script = CAPTIONS_DIR / ("install-windows.bat" if IS_WINDOWS else "install-mac.command")
@@ -877,6 +934,8 @@ class CaptionsPage(ToolPage):
     def after_finished(self, code: int):
         if code == 0 and self.video.value():
             srt = Path(self.video.value()).with_suffix(".srt")
+            if srt.exists():
+                self._last_srt = srt   # remembered for the "Compare .srt" panel
             target = srt if srt.exists() else Path(self.video.value()).parent
             open_folder(target)
             self.status_detail.setText(f"{srt.name} ready." if srt.exists()
