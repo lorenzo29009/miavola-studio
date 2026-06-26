@@ -232,6 +232,24 @@ def join_soft_hyphens(text: str) -> str:
     return _SOFT_HYPHEN_RE.sub(r"\1", text)
 
 
+# A hyphen at the end of a line ("Schilddrüsen-\nbehandlungen", "Geld-\nZurück")
+# is a word broken across two lines. When such a caption is flattened to one
+# line, the "\n" must NOT become a space — that would leave a stray "wort- wort"
+# whose hyphen no longer breaks anything (the word now sits whole on one line).
+_LINEBREAK_HYPHEN_RE = re.compile(r"-[ \t]*\n[ \t]*")
+
+
+def flatten_lines(text: str) -> str:
+    """Collapse a caption's line break(s) onto one line for re-packing. A "\n"
+    that directly follows a hyphen rejoins with NO space (the word was split
+    across lines); join_soft_hyphens then drops the hyphen for a lowercase
+    compound continuation ("Schilddrüsenbehandlungen"), while a real hyphen
+    before an uppercase/digit continuation ("Geld-Zurück") is kept. Every other
+    "\n" becomes a normal space. This is the single safe way to flatten — a bare
+    text.replace("\\n", " ") would smuggle a stray mid-line hyphen into the .srt."""
+    return join_soft_hyphens(_LINEBREAK_HYPHEN_RE.sub("-", text)).replace("\n", " ")
+
+
 def strip_punct(w: str) -> str:
     # \w in UNICODE mode covers letters from all the languages we care about
     # (ä, é, ñ, à, ç, ü, ...).
@@ -1122,7 +1140,7 @@ def finalize_caption(text: str) -> str:
     # A hyphen is only valid at the end of line 1 of a real two-line split, and
     # that split is re-derived below from whole words; it is never shown mid-line.
     whole = join_soft_hyphens(normalized)
-    flat = " ".join(whole.replace("\n", " ").split())
+    flat = " ".join(flatten_lines(normalized).split())
     if text_width(flat) <= LINE_W_MAX:
         return flat  # one line, whole words, no hyphen
     # Two lines are needed. Keep the model's own break when both halves already
@@ -1138,7 +1156,7 @@ def finalize_caption(text: str) -> str:
 
 def _flat_text(seg: dict) -> str:
     """Caption text as a single line (line breaks removed)."""
-    return " ".join(seg["text"].replace("\n", " ").split())
+    return " ".join(flatten_lines(seg["text"]).split())
 
 
 def _fits_two_lines(text: str) -> bool:
@@ -1484,7 +1502,7 @@ def enforce_single_line(segments: list, words: list) -> list:
     deterministic rather than relying on the model to count characters."""
     out = []
     for seg in segments:
-        flat = " ".join(join_soft_hyphens(seg["text"]).replace("\n", " ").split())
+        flat = " ".join(flatten_lines(seg["text"]).split())
         tokens = flat.split()
         s, e = seg["start"], seg["end"]
         chunks = _split_one_line(tokens) if len(tokens) >= 2 else [tokens]
