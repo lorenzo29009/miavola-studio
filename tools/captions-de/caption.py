@@ -987,20 +987,118 @@ def _brand_config():
     return os.environ.get("CAPTION_BRAND", "").strip()
 
 
-def _brand_re(brand: str):
-    # Match the brand even when WhisperX split or hyphenated it ("Mia Vola",
-    # "mia-vola", "Mariposa"), allowing an optional space/hyphen between letters.
-    letters = [re.escape(c) for c in brand if not c.isspace()]
+def _term_core(s: str) -> str:
+    """Lowercased alphanumeric skeleton of a word/term — spaces, hyphens and
+    punctuation removed (umlauts/ß kept, since \\w is Unicode). Lets us compare a
+    caption word to a canonical term regardless of spacing, hyphenation or case."""
+    return re.sub(r"[^\w]", "", s.lower(), flags=re.UNICODE).replace("_", "")
+
+
+def _term_variant_re(term: str):
+    # Match a term even when WhisperX split, hyphenated or re-cased it ("Mia Vola",
+    # "mia-vola", "l-thyroxin"): its alphanumeric letters in order, with an optional
+    # space/hyphen allowed between each. Separators/case in the term itself are
+    # ignored here — exact spelling/case is restored by substituting the canonical.
+    letters = [re.escape(c) for c in term if c.isalnum()]
+    if not letters:
+        return None
     return re.compile(r"\b" + r"[\s\-]?".join(letters) + r"\b", re.IGNORECASE)
 
 
-def apply_brand(text: str) -> str:
-    """Normalize mis-transcriptions of the configured brand to its canonical
-    spelling. No-op unless CAPTION_BRAND is set — the tool ships brand-agnostic."""
+def _levenshtein(a: str, b: str, cap: int) -> int:
+    """Edit distance, abandoned early once it exceeds `cap` (returns cap+1 then).
+    Inputs are single caption words, so the plain DP is more than fast enough."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        row_best = i
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            v = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur.append(v)
+            row_best = min(row_best, v)
+        if row_best > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def _fuzz_cap(n: int) -> int:
+    # Edits tolerated when matching a mis-transcription to a canonical term,
+    # scaled to the term's length: tight on short terms (a 7-letter brand allows
+    # exactly ONE edit, so "Miawola"→"Miavola" but not unrelated 7-letter words),
+    # looser on long compounds ("L-tyroxin"→"L-Thyroxin").
+    if n <= 7:
+        return 1
+    if n <= 14:
+        return 2
+    return 3
+
+
+def _canonical_terms() -> list:
+    """Ordered, de-duplicated canonical spellings to ENFORCE in the output: the
+    brand (CAPTION_BRAND) first, then CAPTION_TERMS. Empty unless configured — the
+    tool ships brand-agnostic. Unlike per-video vocabulary, these are STABLE
+    brand/domain words (the brand name, a recurring product/ingredient); enforcing
+    their exact spelling deterministically is the one place overfitting is wanted."""
     brand = _brand_config()
-    if not brand:
+    terms = [t.strip() for t in os.environ.get("CAPTION_TERMS", "").split(",") if t.strip()]
+    out, seen = [], set()
+    for t in ([brand] if brand else []) + terms:
+        k = t.lower()
+        if t and k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out
+
+
+def apply_canonical_terms(text: str) -> str:
+    """Force every configured canonical term to its exact spelling AND case,
+    repairing WhisperX mishearings. Two layers:
+      1. exact letters with stray spaces/hyphens/case ("Mia Vola", "l-thyroxin")
+         → the canonical form;
+      2. a bounded fuzzy pass for near-miss mishearings ("Miawola"→"miavola",
+         "L-tyroxin"→"L-Thyroxin"), gated by a first-letter match, a 5-char floor
+         and a length-scaled edit-distance cap so ordinary words stay untouched.
+    No-op unless CAPTION_BRAND / CAPTION_TERMS are set (ships brand-agnostic)."""
+    terms = _canonical_terms()
+    if not terms:
         return text
-    return _brand_re(brand).sub(brand, text)
+
+    # Layer 1 — separator/case variants of the exact letters.
+    for term in terms:
+        rx = _term_variant_re(term)
+        if rx:
+            text = rx.sub(lambda _m, t=term: t, text)
+
+    # Layer 2 — fuzzy, token by token (whitespace and newlines preserved). Only
+    # for terms with a 5+ char skeleton, where an edit-distance match is meaningful.
+    cores = [(t, _term_core(t)) for t in terms]
+    cores = [(t, c) for t, c in cores if len(c) >= 5]
+    if not cores:
+        return text
+
+    pieces = re.split(r"(\s+)", text)
+    for idx, tok in enumerate(pieces):
+        if not tok or tok.isspace():
+            continue
+        m = re.match(r"^(\W*)(.*?)(\W*)$", tok, flags=re.UNICODE)
+        prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+        core = _term_core(body)
+        if len(core) < 5:
+            continue
+        for term, tcore in cores:
+            if core == tcore:
+                break  # already the canonical skeleton — keep Layer 1's result
+            if core[0] != tcore[0]:
+                continue
+            cap = _fuzz_cap(len(tcore))
+            if _levenshtein(core, tcore, cap) <= cap:
+                pieces[idx] = prefix + term + suffix
+                break
+    return "".join(pieces)
 
 
 def project_terms_block() -> str:
@@ -1018,7 +1116,7 @@ def project_terms_block() -> str:
 
 
 def finalize_caption(text: str) -> str:
-    normalized = apply_brand(normalize_text_preserve_breaks(text))
+    normalized = apply_canonical_terms(normalize_text_preserve_breaks(text))
     # Collapse any model-inserted in-word compound hyphen back into the whole
     # word, WHEREVER it sits — even mid-line (e.g. "meine Schilddrüsen-werte").
     # A hyphen is only valid at the end of line 1 of a real two-line split, and
