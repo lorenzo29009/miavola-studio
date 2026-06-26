@@ -64,6 +64,13 @@ NARROW_CHARS = set("iIlj.,'!:;|ftr ()[]-")
 WIDE_CHARS = set("mwMW—")
 LINE_W_MAX = 22.5     # max width units on one visible line (~84% of frame width)
 ORPHAN_W_MAX = 7.0    # a single word this narrow is too short to stand alone
+# A multi-word line can wrap at a space, so it may use the full LINE_W_MAX. A
+# single long compound word CANNOT — if its real (bold CapCut) width tops the
+# line it spills mid-word onto an ugly 3rd line ("Schilddrüsenunterfunktion",
+# 21 units / 25 chars, did exactly that). So a solo compound is hyphenated with a
+# safety margin BELOW the line budget; shorter ones ("Wassereinlagerungen",
+# 17.4) still sit whole on their own line.
+SOLO_WORD_W_MAX = 20.0
 
 
 def text_width(s: str) -> float:
@@ -187,12 +194,13 @@ COMPOUND_PREFIXES = [
 
 
 def auto_hyphenate(word: str) -> str:
-    # Hyphenate ONLY a word that cannot fit a single line on its own (by rendered
-    # width). A compound that fits a line — even a long-looking one like
-    # "Schilddrüsenwerte" or "Wassereinlagerungen" — is left whole, so it can sit
-    # on its own line with NO hyphen. The hyphen exists solely to break a word
-    # that is wider than one whole line across two lines.
-    if "\n" in word or text_width(word) <= LINE_W_MAX:
+    # Hyphenate a solo compound word whose rendered width approaches the line
+    # budget (SOLO_WORD_W_MAX) — it can't wrap at a space, so left whole it
+    # spills mid-word onto a 3rd line. A genuinely short compound — even a
+    # long-looking one like "Schilddrüsenwerte" or "Wassereinlagerungen" — stays
+    # whole on its own line with NO hyphen. The hyphen exists solely to keep an
+    # over-long word from overflowing its line.
+    if "\n" in word or text_width(word) <= SOLO_WORD_W_MAX:
         return word
     if word in FORCE_HYPHEN:
         return FORCE_HYPHEN[word]
@@ -248,6 +256,23 @@ def flatten_lines(text: str) -> str:
     "\n" becomes a normal space. This is the single safe way to flatten — a bare
     text.replace("\\n", " ") would smuggle a stray mid-line hyphen into the .srt."""
     return join_soft_hyphens(_LINEBREAK_HYPHEN_RE.sub("-", text)).replace("\n", " ")
+
+
+# A soft compound hyphen is only meaningful at the END of a line — it breaks an
+# over-long word across two lines. If packing ends up with both halves on the
+# SAME line, the hyphen breaks nothing and must vanish (the word reads whole).
+# Matches a hyphen between two word chars with the continuation on the same line;
+# a hyphen before a space ("Muskel- und"), an uppercase/digit ("Geld-Zurück",
+# "90-Tage") or a line end is left intact.
+_MIDLINE_HYPHEN_RE = re.compile(r"(?<=\w)-([a-zäöüß])")
+
+
+def drop_midline_hyphens(text: str) -> str:
+    """Collapse a soft compound hyphen that packing left mid-line (both halves on
+    one visible line) back into the whole word. End-of-line hyphens — the half
+    before a "\\n" — are kept, since there the hyphen really does break the word
+    across the two lines."""
+    return "\n".join(_MIDLINE_HYPHEN_RE.sub(r"\1", ln) for ln in text.split("\n"))
 
 
 def strip_punct(w: str) -> str:
@@ -1151,7 +1176,7 @@ def finalize_caption(text: str) -> str:
         parts = [p.strip() for p in whole.split("\n", 1)]
         if len(parts) == 2 and all(text_width(p) <= LINE_W_MAX for p in parts):
             return fix_line_break(whole)
-    return fix_line_break(pack_lines(apply_auto_hyphenation(flat)))
+    return drop_midline_hyphens(fix_line_break(pack_lines(apply_auto_hyphenation(flat))))
 
 
 def _flat_text(seg: dict) -> str:
