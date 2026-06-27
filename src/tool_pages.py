@@ -405,12 +405,13 @@ FLOW_AVATARS = [
     ("👵", "Härtefall Heinz (55)", "HärHei"),
     ("👩🏻", "Pille Pauline (26)", "PiPa"),
     ("👩‍🦰", "Hertha Junior (29)", "HeJu"),
-    ("💦", "Wasser Waltraud (55)", "WaWa"),
+    ("💦", "Wasser Waltraud (55)", "WaWi"),
     ("🤰", "Blähbauch Berta (42)", "BlBe"),
     ("👶", "Mama Mia (34)", "MaMi"),
     ("🧠", "Brainfog Betty (45)", "BrBe"),
-    ("🙅‍♀️", "Undiagnostizierte Uli", "UnUl"),
+    ("🙅‍♀️", "Undiagnostizierte Uli", "UnUi"),
     ("✨", "Strahlende Sandra (42)", "StSa"),
+    ("🤱", "Schwangerer Haarausfall", "SchwHaa"),
 ]
 
 FLOW_AD_FORMATS = [
@@ -481,6 +482,7 @@ class FlowCropperPage(ToolPage):
         self.input_mode = Segmented(["Auto", "Manual", "Simple"])
         self.input_mode.currentChanged.connect(
             lambda _i: self._update_visibility(self.input_mode.currentText()))
+        self.input_mode.setCurrentText("Manual")
         mode_row.addWidget(self.input_mode)
         lay.addWidget(_panel(mode_row))
 
