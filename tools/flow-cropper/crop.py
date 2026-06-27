@@ -127,22 +127,93 @@ def detect_creative_id(folder_name: str):
     return None
 
 
-def crop_to_4x5(src: Path, dst: Path, ffmpeg: str):
-    result = subprocess.run(
-        [
-            ffmpeg, "-y", "-i", str(src),
-            "-vf", "crop=iw:iw*5/4:0:(ih-iw*5/4)/2",
-            # The crop forces a re-encode (it changes the frames), and that
-            # re-encode is ~80% of the runtime. "faster" cuts a single clip
-            # from ~19.5s to ~11.7s vs the libx264 default ("medium") while
-            # staying visually equivalent (VMAF 94.7 vs 95.3) and the same
-            # file size. Software/cross-platform — no per-OS branching.
-            "-preset", "faster",
-            "-c:a", "copy",
-            str(dst),
-        ],
-        capture_output=True, text=True,
-    )
+# The crop forces a re-encode (it changes the frames), and that re-encode is
+# ~80% of the runtime. By default we hand it to the machine's hardware media
+# engine (Apple VideoToolbox on Mac; NVENC/QSV/AMF on Windows) — typically
+# 5–10x faster than the CPU and it leaves the cores free. If no hardware encoder
+# works here we fall back to libx264 (software, always available).
+VF_CROP = "crop=iw:iw*5/4:0:(ih-iw*5/4)/2"
+
+
+def _list_encoders(ffmpeg: str) -> set:
+    """The encoder names ffmpeg was compiled with (compiled-in ≠ usable)."""
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                           capture_output=True, text=True)
+        return set(re.findall(r"^\s*[A-Z.]{6}\s+(\S+)", r.stdout, re.M))
+    except Exception:
+        return set()
+
+
+def _encoder_opens(ffmpeg: str, enc: str) -> bool:
+    """Actually open the encoder on this machine with one throwaway frame —
+    being compiled in doesn't mean it runs (e.g. NVENC without an NVIDIA GPU)."""
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=256x256:d=1",
+            "-frames:v", "1", "-c:v", enc]
+    if enc != "libx264":
+        args += ["-b:v", "1M"]
+    args += ["-f", "null", "-"]
+    try:
+        return subprocess.run(args, capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def select_encoder(ffmpeg: str) -> str:
+    """Fastest H.264 encoder that actually works here, else libx264."""
+    available = _list_encoders(ffmpeg)
+    if IS_MAC:
+        candidates = ["h264_videotoolbox"]
+    elif IS_WINDOWS:
+        candidates = ["h264_nvenc", "h264_qsv", "h264_amf"]
+    else:
+        candidates = []
+    for enc in candidates:
+        if enc in available and _encoder_opens(ffmpeg, enc):
+            return enc
+    return "libx264"
+
+
+def _source_bitrate_kbps(ffmpeg: str, src: Path):
+    """Source's overall bitrate from ffmpeg's own probe output — no ffprobe
+    needed (it isn't always installed alongside ffmpeg). kbps, or None."""
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(src)],
+                           capture_output=True, text=True)
+    except Exception:
+        return None
+    m = re.search(r"bitrate:\s*(\d+)\s*kb/s", r.stderr)
+    return int(m.group(1)) if m else None
+
+
+def _encode_args(ffmpeg: str, src: Path, dst: Path, encoder: str) -> list:
+    base = [ffmpeg, "-y", "-i", str(src), "-vf", VF_CROP]
+    if encoder == "libx264":
+        # "faster" cuts a single clip from ~19.5s to ~11.7s vs the libx264
+        # default ("medium"), visually equivalent (VMAF 94.7 vs 95.3), same size.
+        venc = ["-c:v", "libx264", "-preset", "faster"]
+    else:
+        # Hardware encoders take a target bitrate, not CRF/qscale. Matching the
+        # source bitrate keeps quality on par and file size ≈ the source: the
+        # 4:5 crop drops ~30% of the pixels (so it needs fewer bits), which about
+        # cancels the hardware encoder's lower efficiency vs x264. Clamped to a
+        # sane range when the probe can't read a bitrate.
+        kbps = _source_bitrate_kbps(ffmpeg, src)
+        target = kbps if kbps else 10000
+        target = max(3500, min(target, 20000))
+        venc = ["-c:v", encoder, "-b:v", f"{target}k"]
+    return base + venc + ["-c:a", "copy", str(dst)]
+
+
+def crop_to_4x5(src: Path, dst: Path, ffmpeg: str, encoder: str = "libx264"):
+    result = subprocess.run(_encode_args(ffmpeg, src, dst, encoder),
+                            capture_output=True, text=True)
+    if result.returncode != 0 and encoder != "libx264":
+        # Hardware path failed on this clip — retry with the software encoder so
+        # the job still completes rather than aborting the whole run.
+        result = subprocess.run(_encode_args(ffmpeg, src, dst, "libx264"),
+                                capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg failed for {src.name}:\n{result.stderr[-600:]}")
 
@@ -201,7 +272,8 @@ def _build_index_pattern(name_for, cta: str) -> "re.Pattern[str]":
 
 def process_folder(folder: Path, name_for, ffmpeg: str, cta: str = "",
                    workers: int = 1, dry_run: bool = False,
-                   actions: list = None, on_action=None):
+                   actions: list = None, on_action=None,
+                   encoder: str = "libx264"):
     nine16 = folder / "9x16"
     four5 = folder / "4x5"
     files = [f for f in nine16.iterdir() if f.suffix.lower() == ".mp4"]
@@ -280,7 +352,7 @@ def process_folder(folder: Path, name_for, ffmpeg: str, cta: str = "",
             safe_print(f"{indent}[{pos}/{total}] would crop {p9.name} → {p4.name}")
             return
         safe_print(f"{indent}[{pos}/{total}] cropping {p9.name} ...")
-        crop_to_4x5(p9, p4, ffmpeg)
+        crop_to_4x5(p9, p4, ffmpeg, encoder)
         safe_print(f"{indent}[{pos}/{total}] ✓ {p4.name}")
         if actions is not None:
             actions.append({"type": "create", "path": str(p4)})
@@ -355,14 +427,20 @@ def run(folder: Path, fields: dict, ffmpeg: str,
         )
 
     structure = detect_structure(folder)
+    # Pick the encoder once per run (the probe is cheap; doing it per clip isn't).
+    # Skip the probe on a dry run — nothing gets encoded.
+    encoder = "libx264" if dry_run else select_encoder(ffmpeg)
+    kind = "software" if encoder == "libx264" else "hardware"
     print(f"Structure: {structure}")
     print(f"Workers  : {workers}")
+    print(f"Encoder  : {encoder} ({kind})")
     if dry_run:
         print("Mode     : DRY RUN (no files will be changed)")
     print()
     if structure == "simple":
         process_folder(folder, name_for, ffmpeg, workers=workers,
-                       dry_run=dry_run, actions=actions, on_action=on_action)
+                       dry_run=dry_run, actions=actions, on_action=on_action,
+                       encoder=encoder)
     else:
         cta_subs = sorted(
             d for d in folder.iterdir()
@@ -371,7 +449,8 @@ def run(folder: Path, fields: dict, ffmpeg: str,
         for cta_dir in cta_subs:
             process_folder(cta_dir, name_for, ffmpeg,
                            cta=cta_dir.name.upper(), workers=workers,
-                           dry_run=dry_run, actions=actions, on_action=on_action)
+                           dry_run=dry_run, actions=actions, on_action=on_action,
+                           encoder=encoder)
     return actions
 
 
