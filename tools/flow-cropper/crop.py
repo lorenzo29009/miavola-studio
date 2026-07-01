@@ -4,14 +4,16 @@ Flow Cropper — 9:16 → 4:5 batch crop + smart rename.
 
 AI and UGC creatives share ONE naming convention:
 
-    {ad_format} - {avatar} - 9x16[_{creator}]_{id}-{i} - {awareness} - {product}.mp4
-    {ad_format} - {avatar} - 9x16[_{creator}]_{id}-{CTA}-{i} - {awareness} - {product}.mp4
+    {ad_format} - {avatar} - {angle} - 9x16[_{creator}]_{id}-{i} - {awareness} - {product}.mp4
+    {ad_format} - {avatar} - {angle} - 9x16[_{creator}]_{id}-{CTA}-{i} - {awareness} - {product}.mp4
 
 `id` is the full creative id, verbatim (e.g. C893, AI78, Cr906). `creator` is
-optional — AI creatives usually have none.
+optional — AI creatives usually have none. `angle` is the ad's angle — found
+in the ad name directly before the creative id (e.g. "... Conversion
+Disorder · C964" → angle "Conversion Disorder").
 
-e.g.  UGC - GeGe - 9x16_Marco_Schlegelmilch_C893-2 - Problem Aware - Umwandler.mp4
-      WB - GeGe - 9x16_AI78-4 - Problem Aware - Umwandler.mp4
+e.g.  UGC - GeGe - Conversion Disorder - 9x16_Marco_Schlegelmilch_C893-2 - Problem Aware - Umwandler.mp4
+      WB - GeGe - Retention Hook - 9x16_AI78-4 - Problem Aware - Umwandler.mp4
 
 The "Videoformat" segment (9x16 / 4x5) and the per-clip index ("-{i}", the
 "Hook") are filled in by the tool; in the generic briefing tag they appear as
@@ -28,7 +30,7 @@ e.g.  9x16 - AI63-2 - Pharmacist.mp4
 
 Usage:
     crop.py                        (interactive — uses system dialogs)
-    crop.py [--dry-run] --creative FOLDER ID AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT
+    crop.py [--dry-run] --creative FOLDER ID AD_FORMAT AVATAR ANGLE CREATOR AWARENESS PRODUCT
     crop.py [--dry-run] --simple FOLDER ID FORMAT
     crop.py --undo FOLDER          (CREATOR may be an empty string)
 """
@@ -229,14 +231,14 @@ def normalize_creative_id(value: str) -> str:
 
 
 def creative_name(aspect: str, creative_id: str, i: int, *, ad_format: str,
-                  avatar: str, creator: str, awareness: str, product: str,
-                  cta: str = "") -> str:
+                  avatar: str, angle: str, creator: str, awareness: str,
+                  product: str, cta: str = "") -> str:
     """The shared AI/UGC convention. `creative_id` is the full id (C893, AI78,
     Cr906…), used verbatim. `creator` is optional (AI creatives have none)."""
     creator_part = f"_{creator}" if creator else ""
     cta_part = f"-{cta}" if cta else ""
     return (
-        f"{ad_format} - {avatar} - {aspect}{creator_part}_{creative_id}{cta_part}-{i} "
+        f"{ad_format} - {avatar} - {angle} - {aspect}{creator_part}_{creative_id}{cta_part}-{i} "
         f"- {awareness} - {product}.mp4"
     )
 
@@ -422,8 +424,8 @@ def run(folder: Path, fields: dict, ffmpeg: str,
         name_for = lambda aspect, i, cta: creative_name(
             aspect, fields["creative_id"], i,
             ad_format=fields["ad_format"], avatar=fields["avatar"],
-            creator=fields["creator"], awareness=fields["awareness"],
-            product=fields["product"], cta=cta,
+            angle=fields["angle"], creator=fields["creator"],
+            awareness=fields["awareness"], product=fields["product"], cta=cta,
         )
 
     structure = detect_structure(folder)
@@ -648,6 +650,9 @@ def interactive(workers: int = DEFAULT_WORKERS):
     avatar = _require(ask_text("Avatar Kürzel (e.g. GeGe):"))
     if not avatar.strip():
         _bail()
+    angle = _require(ask_text("Angle (e.g. Conversion Disorder):"))
+    if not angle.strip():
+        _bail()
     # Creator is optional — AI creatives have none. Empty answer is allowed.
     creator = normalize_creator(_require(ask_text(
         "Creator (optional, e.g. Marco Schlegelmilch):")))
@@ -660,7 +665,7 @@ def interactive(workers: int = DEFAULT_WORKERS):
     fields = {
         "creative_id": creative_id.strip(),
         "ad_format": ad_format.strip(), "avatar": avatar.strip(),
-        "creator": creator, "awareness": awareness.strip(),
+        "angle": angle.strip(), "creator": creator, "awareness": awareness.strip(),
         "product": product.strip(),
     }
 
@@ -691,6 +696,7 @@ def run_with(folder: Path, fields: dict,
     else:
         print(f"Ad format : {fields['ad_format']}")
         print(f"Avatar    : {fields['avatar']}")
+        print(f"Angle     : {fields['angle']}")
         print(f"Creator   : {fields['creator'] or '(none)'}")
         print(f"Awareness : {fields['awareness']}")
         print(f"Product   : {fields['product']}")
@@ -774,18 +780,19 @@ def main():
         return
 
     if args and args[0] == "--creative":
-        if len(args) < 8:
+        if len(args) < 9:
             print("Usage: crop.py --creative FOLDER ID "
-                  "AD_FORMAT AVATAR CREATOR AWARENESS PRODUCT")
+                  "AD_FORMAT AVATAR ANGLE CREATOR AWARENESS PRODUCT")
             sys.exit(2)
         fields = {
             "mode": "full",
             "creative_id": args[2].strip(),
             "ad_format": args[3].strip(),
             "avatar": args[4].strip(),
-            "creator": normalize_creator(args[5]),
-            "awareness": args[6].strip(),
-            "product": args[7].strip() or DEFAULT_PRODUCT,
+            "angle": args[5].strip(),
+            "creator": normalize_creator(args[6]),
+            "awareness": args[7].strip(),
+            "product": args[8].strip() or DEFAULT_PRODUCT,
         }
         run_with(Path(args[1]).expanduser().resolve(), fields,
                  workers=workers, dry_run=dry_run)
