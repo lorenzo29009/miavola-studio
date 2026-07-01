@@ -13,15 +13,23 @@ EOF
 fi
 
 # macOS privacy (TCC) guard: when the app lives inside the Desktop, Documents,
-# or Downloads folder — synced to iCloud or not, that's irrelevant — a
-# double-clicked (Finder-launched) app is DENIED read access to its own files,
-# so Python dies with "Operation not permitted" on venv files. Terminal-launched
-# runs work because Terminal already holds the folder grant — which is exactly
-# why this looks like "won't open at all" only on double-click. The installer
-# (install-mac.command) auto-relocates out of these folders on first install, so
-# this should only fire if the folder was manually moved back afterward. Detect
-# the denial (we can't read our own venv config) and tell the user to move it.
-if ! cat "$STUDIO_DIR/venv/pyvenv.cfg" >/dev/null 2>&1; then
+# or Downloads folder, a double-clicked (Finder-launched) app is DENIED read
+# access to its own files, so Python dies with "Operation not permitted" on
+# venv files. Confirmed live on 2026-07-01 on macOS 26.5.2 (Tahoe): without
+# this guard, CPython itself throws `PermissionError: [Errno 1] Operation not
+# permitted` on pyvenv.cfg when launched via `open`/Finder from ~/Desktop —
+# this is a real macOS-level denial, not an invented check. Terminal-launched
+# runs work because Terminal already holds the folder grant, which is why this
+# only bites on double-click. Tahoe (major version 26) tightened enforcement
+# of this protection versus prior releases, so gate the check on that — older
+# macOS versions don't reproduce this failure and shouldn't be bothered by it.
+# The installer (install-mac.command) auto-relocates out of these folders on
+# first install (also Tahoe-gated), so this should only fire if the folder
+# was moved back after.
+MACOS_MAJOR="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"
+case "$MACOS_MAJOR" in ''|*[!0-9]*) MACOS_MAJOR=0 ;; esac
+
+if [ "$MACOS_MAJOR" -ge 26 ] && ! cat "$STUDIO_DIR/venv/pyvenv.cfg" >/dev/null 2>&1; then
     /usr/bin/osascript <<EOF
 display dialog "macOS is blocking Mariposa Studio from reading its own files because the folder is inside your Desktop, Documents, or Downloads folder.\n\nFix: move the whole \"Mariposa Studio\" folder out of that location — for example into your Home folder or Applications — then open it again from there." buttons {"OK"} default button "OK" with icon stop with title "Mariposa Studio"
 EOF

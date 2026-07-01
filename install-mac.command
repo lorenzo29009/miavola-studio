@@ -2,40 +2,47 @@
 set -e
 cd "$(dirname "$0")"
 
-# ---- Auto-relocate out of Desktop/Documents/Downloads (macOS TCC trap) ---
+# ---- Auto-relocate out of Desktop/Documents/Downloads (macOS 26+ TCC trap) --
 # macOS's "Files and Folders" privacy protection covers ~/Desktop, ~/Documents,
-# and ~/Downloads for ANY double-clicked, unsigned app — regardless of whether
+# and ~/Downloads for double-clicked, unsigned apps — regardless of whether
 # iCloud sync is even on. A Finder launch of Mariposa Studio.app from inside
-# one of those folders gets silently denied read access to its own venv
-# ("Operation not permitted"), so it looks broken. Terminal (running this
-# installer right now) already holds that grant, which is exactly why install
-# succeeds here but a later double-click can fail. Rather than ship that trap
-# to every user, relocate the whole folder once, now, before creating venv/.
-case "$(pwd)" in
-    "$HOME/Desktop"/*|"$HOME/Documents"/*|"$HOME/Downloads"/*|"$HOME/Library/Mobile Documents"/*)
-        NAME="$(basename "$(pwd)")"
-        TARGET="$HOME/Applications/$NAME"
-        if [ -e "$TARGET" ]; then
+# one of those folders gets denied read access to its own venv ("Operation not
+# permitted"), so it looks broken. Terminal (running this installer right now)
+# already holds that grant, which is exactly why install succeeds here but a
+# later double-click can fail. Confirmed live (2026-07-01) on macOS 26.5.2
+# (Tahoe): Tahoe tightened enforcement of this protection versus prior
+# releases, so this reproduces there but not on older macOS — gate on that so
+# we don't relocate anyone's folder on a version where the bug doesn't exist.
+MACOS_MAJOR="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"
+case "$MACOS_MAJOR" in ''|*[!0-9]*) MACOS_MAJOR=0 ;; esac
+
+if [ "$MACOS_MAJOR" -ge 26 ]; then
+    case "$(pwd)" in
+        "$HOME/Desktop"/*|"$HOME/Documents"/*|"$HOME/Downloads"/*|"$HOME/Library/Mobile Documents"/*)
+            NAME="$(basename "$(pwd)")"
+            TARGET="$HOME/Applications/$NAME"
+            if [ -e "$TARGET" ]; then
+                echo ""
+                echo "!! This folder is inside Desktop/Documents/Downloads, which macOS 26+ blocks"
+                echo "   double-clicked apps from reading. Wanted to move it to:"
+                echo "     $TARGET"
+                echo "   ...but that already exists. Move or remove it, then re-run this installer."
+                exit 1
+            fi
             echo ""
-            echo "!! This folder is inside Desktop/Documents/Downloads, which macOS blocks"
-            echo "   double-clicked apps from reading. Wanted to move it to:"
+            echo ">> This folder is inside Desktop/Documents/Downloads. macOS 26+ blocks"
+            echo "   double-clicked apps from reading their own files there, so this"
+            echo "   installer is moving the whole folder to:"
             echo "     $TARGET"
-            echo "   ...but that already exists. Move or remove it, then re-run this installer."
-            exit 1
-        fi
-        echo ""
-        echo ">> This folder is inside Desktop/Documents/Downloads. macOS blocks"
-        echo "   double-clicked apps from reading their own files there, so this"
-        echo "   installer is moving the whole folder to:"
-        echo "     $TARGET"
-        mkdir -p "$HOME/Applications"
-        mv "$(pwd)" "$TARGET"
-        # Leave a Finder alias behind so double-click habits still work.
-        osascript -e 'tell application "Finder" to make alias file to (POSIX file "'"$TARGET"'") at desktop' >/dev/null 2>&1 || true
-        echo ">> Continuing installation from the new location..."
-        exec "$TARGET/install-mac.command"
-        ;;
-esac
+            mkdir -p "$HOME/Applications"
+            mv "$(pwd)" "$TARGET"
+            # Leave a Finder alias behind so double-click habits still work.
+            osascript -e 'tell application "Finder" to make alias file to (POSIX file "'"$TARGET"'") at desktop' >/dev/null 2>&1 || true
+            echo ">> Continuing installation from the new location..."
+            exec "$TARGET/install-mac.command"
+            ;;
+    esac
+fi
 
 clear
 cat <<'BANNER'
