@@ -1613,11 +1613,18 @@ def learn_and_relabel_case(segments: list) -> list:
         return tok
 
     out = []
-    for seg in segments:
+    for idx, seg in enumerate(segments):
         lines = seg["text"].split("\n")
         first = lines[0].split()
         if first:
-            first[0] = relabel_first(first[0])
+            if idx == 0:
+                # The hook: caption 0 is a genuine sentence start, not a
+                # mid-sentence fragment — always capitalise it.
+                w = first[0]
+                if w[:1].isalpha():
+                    first[0] = w[:1].upper() + w[1:]
+            else:
+                first[0] = relabel_first(first[0])
             lines[0] = " ".join(first)
         out.append({**seg, "text": "\n".join(lines)})
     return out
@@ -1633,6 +1640,7 @@ RULES:
 - A noun stays a noun after a determiner or quantifier — capitalise it: "jeden Morgen", "jeden Tag", "jede Woche", "am Abend", "die Dosis", "ihre Werte" (the noun "Werte" is capital regardless of the word before it). Watch the time-of-day nouns "Morgen/Abend/Mittag/Tag/Nacht" — capital as nouns ("jeden Morgen"), lowercase ONLY as the adverb "morgens/abends" or "morgen" meaning tomorrow.
 - Capitalise the formal-address words Sie, Ihr, Ihre, Ihren, Ihrem, Ihrer, Ihres, Ihnen when they mean the formal "you". Use the SURROUNDING captions as context: e.g. a doctor quoted speaking to the patient ("… der gleiche Satz: ihre Werte sind doch in Ordnung") is formal → "Ihre Werte". Keep "sie/ihr" lowercase only when they clearly mean she / they / her.
 - EVERYTHING ELSE is lowercase, INCLUDING THE FIRST WORD of a caption. These are mid-sentence fragments — never capitalise a word just because it starts the line. Verbs, adjectives, adverbs, pronouns, articles, prepositions and conjunctions stay lowercase at the start ("bis", "egal", "von", "jeden", "trinkst", "gesund", "und").
+- EXCEPTION: caption [0] is the video's opening line (the hook) — it is a genuine sentence start, not a mid-sentence fragment. Its first word MUST be capitalised like any normal German sentence start, even if the same word would stay lowercase elsewhere (e.g. "Bis", "Trinkst", "Und"). This exception applies ONLY to caption [0].
 - Change ONLY letter case. Do NOT add, remove, reorder, split, merge or respell any word. Do NOT change any digit, punctuation mark or spacing.
 
 Captions:

@@ -5,11 +5,33 @@ STUDIO_DIR="$(dirname "$APP_PATH")"
 
 cd "$STUDIO_DIR"
 
-if [ ! -x "./venv/bin/python" ]; then
+if [ ! -x "$STUDIO_DIR/venv/bin/python" ]; then
     /usr/bin/osascript <<EOF
 display dialog "Mariposa Studio isn't installed yet.\n\nPlease run install-mac.command (right-click → Open) from the Mariposa Studio folder first." buttons {"OK"} default button "OK" with icon stop with title "Mariposa Studio"
 EOF
     exit 1
 fi
 
-exec ./venv/bin/python src/studio.py
+# macOS privacy (TCC) guard: when the app lives inside the Desktop, Documents,
+# or Downloads folder — synced to iCloud or not, that's irrelevant — a
+# double-clicked (Finder-launched) app is DENIED read access to its own files,
+# so Python dies with "Operation not permitted" on venv files. Terminal-launched
+# runs work because Terminal already holds the folder grant — which is exactly
+# why this looks like "won't open at all" only on double-click. The installer
+# (install-mac.command) auto-relocates out of these folders on first install, so
+# this should only fire if the folder was manually moved back afterward. Detect
+# the denial (we can't read our own venv config) and tell the user to move it.
+if ! cat "$STUDIO_DIR/venv/pyvenv.cfg" >/dev/null 2>&1; then
+    /usr/bin/osascript <<EOF
+display dialog "macOS is blocking Mariposa Studio from reading its own files because the folder is inside your Desktop, Documents, or Downloads folder.\n\nFix: move the whole \"Mariposa Studio\" folder out of that location — for example into your Home folder or Applications — then open it again from there." buttons {"OK"} default button "OK" with icon stop with title "Mariposa Studio"
+EOF
+    exit 1
+fi
+
+# Invoke the interpreter and script by ABSOLUTE path. When Finder/LaunchServices
+# opens the bundle (especially from an iCloud "Desktop & Documents" file-provider
+# folder), the spawned process can't getcwd() this directory, so a RELATIVE
+# interpreter path makes CPython's getpath crash with
+#   "OSError: failed to make path absolute / Fatal Python error: error evaluating path"
+# before any app code runs. Absolute paths never need getcwd(), so this launches.
+exec "$STUDIO_DIR/venv/bin/python" "$STUDIO_DIR/src/studio.py"

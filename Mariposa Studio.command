@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(dirname "$0")"
+STUDIO_DIR="$(pwd)"
 
 if [ ! -x "./venv/bin/python" ]; then
     clear
@@ -14,5 +15,7 @@ if [ ! -x "./venv/bin/python" ]; then
     exit 1
 fi
 
-# Run the app without keeping the terminal window around.
-exec ./venv/bin/python src/studio.py
+# Run the app without keeping the terminal window around. Absolute paths so the
+# interpreter never needs getcwd() (which fails under some Finder/iCloud launch
+# contexts and crashes CPython's getpath before any app code runs).
+exec "$STUDIO_DIR/venv/bin/python" "$STUDIO_DIR/src/studio.py"
